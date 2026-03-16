@@ -1,0 +1,3370 @@
+---
+title: "Baseline Analysis of Organ ages"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load required libraries
+library(tidyverse)
+library(survival)
+library(lmtest)
+library(sandwich)
+library(patchwork)
+library(svglite)
+select = dplyr::select
+rename = dplyr::rename
+set.seed(964)
+```
+
+```{r config}
+# Output paths (set these for your environment)
+output_root_dir <- "PATH/TO/output"
+output_current_health_dir <- file.path(output_root_dir, "current_health")
+output_prevalent_disease_dir <- file.path(output_root_dir, "prevalent_disease")
+
+# Backward-compatible aliases used throughout this script
+current_health_base <- output_current_health_dir
+prevalent_disease_base <- output_prevalent_disease_dir
+
+ensure_dir <- function(path) { dir.create(path, showWarnings = FALSE, recursive = TRUE) }
+save_plot <- function(filename, plot, width, height, dpi = 300) {
+  ensure_dir(dirname(filename))
+  ggplot2::ggsave(filename = filename, plot = plot, width = width, height = height, dpi = dpi)
+}
+# Disable direct ggsave calls in this Rmd to enforce centralized paths via save_plot
+ggsave <- function(...) { invisible(NULL) }
+```
+
+## Data Loading and Processing
+
+```{r load_data}
+# Input files (set these for your environment)
+input_metadata_file <- "PATH/TO/input_metadata.csv"
+input_organ_age_file <- "PATH/TO/input_organ_age.csv"
+input_diagnosis_file <- "PATH/TO/input_diagnosis.csv"
+input_cancer_file <- "PATH/TO/input_cancer.csv"
+
+# Core schema configuration
+id_col <- "twin_id"
+pair_col <- "pair_id"
+sex_col <- "sex"
+male_code <- 1
+female_code <- 2
+age_col <- "age"
+
+# Optional organ-specific columns (set to NULL if not present)
+ovary_col <- "Ovary"
+prostate_col <- "Prostate"
+
+# Optional prefix to remove from organ-age columns
+organ_age_prefix_to_strip <- "tuned_mortality_"
+
+# Load datasets
+twins <- read_csv(input_metadata_file)
+
+organ_age_mortality <- read_csv(input_organ_age_file)
+
+# Load disease data
+med_history <- read_csv(input_diagnosis_file) |>
+  filter(.data[[id_col]] %in% twins[[id_col]])
+
+# Load cancer data
+cancer <- read_csv(input_cancer_file) |>
+  filter(.data[[id_col]] %in% twins[[id_col]])
+
+# Merge disease and cancer data
+med_history <- med_history |>
+  left_join(cancer, by = id_col)
+
+
+# Create twins_analysis dataframe
+twins_analysis <- twins |>
+  left_join(med_history, by = id_col)
+
+if ("healthspan" %in% names(twins_analysis)) {
+  twins_analysis <- twins_analysis |> arrange(desc(healthspan))
+}
+
+# Process organ age data
+if (!is.null(organ_age_prefix_to_strip) && nzchar(organ_age_prefix_to_strip)) {
+  organ_age_mortality <- organ_age_mortality |>
+    rename_with(~str_remove(., paste0("^", organ_age_prefix_to_strip)), everything())
+}
+
+# Process organ ages based on sex
+organ_age_mortality <- organ_age_mortality |>
+  left_join(select(twins_analysis, all_of(c(id_col, sex_col))), by = id_col)
+
+if (!is.null(ovary_col) && ovary_col %in% names(organ_age_mortality)) {
+  organ_age_mortality <- organ_age_mortality |>
+    mutate("{ovary_col}" := if_else(.data[[sex_col]] == male_code, NA_real_, .data[[ovary_col]]))
+}
+
+if (!is.null(prostate_col) && prostate_col %in% names(organ_age_mortality)) {
+  organ_age_mortality <- organ_age_mortality |>
+    mutate("{prostate_col}" := if_else(.data[[sex_col]] == female_code, NA_real_, .data[[prostate_col]]))
+}
+
+organ_age_mortality <- organ_age_mortality |>
+  select(-all_of(sex_col))
+
+# Create analysis datasets
+twins_mortality <- twins_analysis |>
+  left_join(organ_age_mortality, by = id_col)
+
+# Get organ age columns
+organ_age_cols_mortality <- names(organ_age_mortality)[names(organ_age_mortality) != id_col]
+
+# Create fi_10 variable if fi exists in twins_analysis dataset
+if ("fi" %in% names(twins_analysis)) {
+  twins_analysis <- twins_analysis |>
+    mutate(fi_10 = fi * 10)
+}
+
+# Optional label dictionaries (leave empty for identity labels)
+clean_names <- function(data) {
+  outcome_clean_names <- c()
+  organ_clean_names <- c()
+
+  data |>
+    mutate(
+      outcome_clean = case_when(
+        outcome %in% names(outcome_clean_names) ~ outcome_clean_names[outcome],
+        TRUE ~ outcome
+      ),
+      predictor_clean = case_when(
+        predictor %in% names(organ_clean_names) ~ organ_clean_names[predictor],
+        TRUE ~ predictor
+      )
+    )
+}
+```
+
+## Analysis Setup
+
+```{r define_outcomes}
+# Define outcomes with grouping (replace placeholders with your variables)
+binary_outcomes <- c("binary_outcome_1", "binary_outcome_2")
+
+lifestyle_outcomes <- c("continuous_lifestyle_1", "continuous_lifestyle_2")
+clinical_biomarkers <- c("continuous_clinical_1", "continuous_clinical_2")
+health_outcomes <- c("continuous_health_1", "continuous_health_2")
+
+# Combine all continuous outcomes
+cont_outcomes <- c(lifestyle_outcomes, clinical_biomarkers, health_outcomes)
+
+# Create outcome groups for plotting
+outcome_groups <- list(
+  "Lifestyle" = lifestyle_outcomes,
+  "Clinical Biomarkers" = clinical_biomarkers,
+  "Health" = health_outcomes
+)
+
+# Covariate sets: choose one and edit as needed
+covariate_sets <- list(
+  minimal = c("age", "sex"),
+  cardiometabolic = c("age", "sex", "bmi"),
+  extended = c("age", "sex", "bmi", "edyrs")
+)
+active_covariate_set <- "minimal"
+
+# Helper function to determine covariates for each outcome
+get_covariates <- function(outcome) {
+  base_covariates <- covariate_sets[[active_covariate_set]]
+  if (is.null(base_covariates)) {
+    stop("Invalid `active_covariate_set` in define_outcomes.")
+  }
+  base_covariates <- base_covariates[base_covariates != outcome]
+  base_covariates <- base_covariates[base_covariates %in% names(twins_analysis)]
+  return(base_covariates)
+}
+```
+
+## Analysis Functions
+
+```{r analysis_functions}
+# Function to analyze binary outcomes
+analyze_binary_outcomes <- function(predictor_df, outcome_vars = binary_outcomes) {
+  map_dfr(outcome_vars, function(outcome) {
+    predictors <- setdiff(colnames(predictor_df), "twin_id")
+
+    map_dfr(predictors, function(predictor) {
+      analysis_data <- twins_analysis |>
+        left_join(predictor_df |> select(twin_id, all_of(predictor)), by = "twin_id")
+
+      # Handle sex-specific organ ages
+      if (predictor == "Ovary") {
+        analysis_data <- analysis_data |> filter(sex == 2)
+        if (nrow(analysis_data) < 10) {
+          return(tibble(
+            outcome = outcome, predictor = predictor,
+            estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+            odds_ratio = NA_real_, ci_lower = NA_real_, ci_upper = NA_real_,
+            standardized_estimate = NA_real_, error_message = "Insufficient data for sex-specific analysis"
+          ))
+        }
+      } else if (predictor == "Prostate") {
+        analysis_data <- analysis_data |> filter(sex == 1)
+        if (nrow(analysis_data) < 10) {
+          return(tibble(
+            outcome = outcome, predictor = predictor,
+            estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+            odds_ratio = NA_real_, ci_lower = NA_real_, ci_upper = NA_real_,
+            standardized_estimate = NA_real_, error_message = "Insufficient data for sex-specific analysis"
+          ))
+        }
+      }
+
+      covariates <- get_covariates(outcome)
+      formula <- as.formula(paste(outcome, "~", predictor,
+                                 if(length(covariates) > 0) paste("+", paste(covariates, collapse = " + ")) else ""))
+
+      tryCatch({
+        model <- glm(formula, data = analysis_data, family = binomial)
+        cluster_se <- vcovCL(model, cluster = ~pair_id)
+        coeftest_model <- coeftest(model, vcov = cluster_se)
+
+        estimate <- coeftest_model[predictor, "Estimate"]
+        std_error <- coeftest_model[predictor, "Std. Error"]
+        or <- exp(estimate)
+        ci_lower <- exp(estimate - 1.96 * std_error)
+        ci_upper <- exp(estimate + 1.96 * std_error)
+
+        tibble(
+          outcome = outcome, predictor = predictor,
+          estimate = estimate, std_error = std_error,
+          z_value = coeftest_model[predictor, "z value"],
+          p_value = coeftest_model[predictor, "Pr(>|z|)"],
+          odds_ratio = or, ci_lower = ci_lower, ci_upper = ci_upper,
+          standardized_estimate = estimate, error_message = NA_character_
+        )
+      }, error = function(e) {
+        tibble(
+          outcome = outcome, predictor = predictor,
+          estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+          odds_ratio = NA_real_, ci_lower = NA_real_, ci_upper = NA_real_,
+          standardized_estimate = NA_real_, error_message = e$message
+        )
+      })
+    })
+  }) |> mutate(FDR = p.adjust(p_value, method = "fdr"))
+}
+
+# Function to analyze continuous outcomes
+analyze_continuous_outcomes <- function(predictor_df, outcome_vars = cont_outcomes) {
+  map_dfr(outcome_vars, function(outcome) {
+    if (!(outcome %in% names(twins_analysis))) {
+      return(tibble(
+        outcome = outcome, predictor = NA_character_,
+        estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+        standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+        error_message = "Variable not found in dataset"
+      ))
+    }
+
+    outcome_data <- twins_analysis[[outcome]]
+    n_unique <- length(unique(outcome_data[!is.na(outcome_data)]))
+
+    if (n_unique < 2) {
+      return(tibble(
+        outcome = outcome, predictor = NA_character_,
+        estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+        standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+        error_message = paste("Insufficient variation: only", n_unique, "unique values")
+      ))
+    }
+
+    predictors <- setdiff(colnames(predictor_df), "twin_id")
+
+    map_dfr(predictors, function(predictor) {
+      analysis_data <- twins_analysis |>
+        left_join(predictor_df |> select(twin_id, all_of(predictor)), by = "twin_id")
+
+      # Handle sex-specific organ ages
+      if (predictor == "Ovary") {
+        analysis_data <- analysis_data |> filter(sex == 2)
+        if (nrow(analysis_data) < 10) {
+          return(tibble(
+            outcome = outcome, predictor = predictor,
+            estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+            standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+            error_message = "Insufficient data for sex-specific analysis"
+          ))
+        }
+      } else if (predictor == "Prostate") {
+        analysis_data <- analysis_data |> filter(sex == 1)
+        if (nrow(analysis_data) < 10) {
+          return(tibble(
+            outcome = outcome, predictor = predictor,
+            estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+            standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+            error_message = "Insufficient data for sex-specific analysis"
+          ))
+        }
+      }
+
+      covariates <- get_covariates(outcome)
+      formula <- as.formula(paste(outcome, "~", predictor,
+                                 if(length(covariates) > 0) paste("+", paste(covariates, collapse = " + ")) else ""))
+
+      tryCatch({
+        model <- glm(formula, data = analysis_data)
+        cluster_se <- vcovCL(model, cluster = ~pair_id)
+        coeftest_model <- coeftest(model, vcov = cluster_se)
+
+        sd_outcome <- sd(analysis_data[[outcome]], na.rm = TRUE)
+        sd_predictor <- sd(analysis_data[[predictor]], na.rm = TRUE)
+        estimate <- coeftest_model[predictor, "Estimate"]
+        std_error <- coeftest_model[predictor, "Std. Error"]
+        standardized_estimate <- estimate * (sd_predictor / sd_outcome)
+        standardized_ci_lower <- (estimate - 1.96 * std_error) * (sd_predictor / sd_outcome)
+        standardized_ci_upper <- (estimate + 1.96 * std_error) * (sd_predictor / sd_outcome)
+
+        tibble(
+          outcome = outcome, predictor = predictor,
+          estimate = estimate, std_error = std_error,
+          z_value = coeftest_model[predictor, "z value"],
+          p_value = coeftest_model[predictor, "Pr(>|z|)"],
+          standardized_estimate = standardized_estimate,
+          standardized_ci_lower = standardized_ci_lower,
+          standardized_ci_upper = standardized_ci_upper,
+          error_message = NA_character_
+        )
+      }, error = function(e) {
+        tibble(
+          outcome = outcome, predictor = predictor,
+          estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+          standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+          error_message = e$message
+        )
+      })
+    })
+  }) |> mutate(FDR = p.adjust(p_value, method = "fdr"))
+}
+```
+
+## Clinical and Biomarker Associations
+
+**Analysis Structure:**
+This section performs univariate linear and logistic regression analyses to examine the association between individual organ ages and baseline clinical and lifestyle outcomes. Each analysis tests whether accelerated organ aging (higher organ age relative to chronological age) is associated with adverse health indicators.
+
+**Model Formula:** 
+- **Linear models:** `outcome ~ organ_age + selected_covariates`
+- **Logistic models:** `outcome ~ organ_age + selected_covariates`
+
+**Key Components:**
+- **Organ age measures:** Mortality-calibrated organ ages (trained on mortality prediction)
+- **Outcomes:** Clinical biomarkers, lifestyle factors, and health indicators
+- **Covariates:** Age, sex, BMI (when not the outcome), and other relevant confounders
+- **Clustering:** Robust standard errors accounting for twin pair clustering
+- **Sex-specific handling:** Separate analyses for sex-specific organs (Ovary, Prostate)
+- **Standardization:** Effect sizes standardized for interpretation across different outcome scales
+
+**Statistical Approach:**
+- **Multiple testing correction:** FDR correction applied to p-values
+- **Effect size interpretation:** Standardized coefficients for continuous outcomes, odds ratios for binary outcomes
+- **Model validation:** Error handling for insufficient data or convergence issues
+
+```{r clinical_associations}
+cont_results <- analyze_continuous_outcomes(organ_age_mortality) |>
+  mutate(model_type = "linear", organ_age_model = "mortality")
+binary_results <- analyze_binary_outcomes(organ_age_mortality) |>
+  mutate(model_type = "logistic", organ_age_model = "mortality")
+
+# Combine results
+all_results <- bind_rows(
+  cont_results,
+  binary_results
+)
+```
+
+## Results Visualization
+
+```{r prepare_heatmap_data}
+# Create heatmap data
+mortality_heatmap_data <- all_results |>
+  filter(organ_age_model == "mortality", is.na(error_message)) |>
+  mutate(
+    effect_size = case_when(
+      model_type == "linear" ~ standardized_estimate,
+      model_type == "logistic" ~ log(odds_ratio)
+    ),
+    significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01 ~ "**",
+      FDR < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    outcome_group = case_when(
+      outcome %in% lifestyle_outcomes ~ "Lifestyle",
+      outcome %in% clinical_biomarkers ~ "Clinical Biomarkers",
+      outcome %in% health_outcomes ~ "Health",
+      outcome %in% binary_outcomes ~ "Lifestyle",
+      TRUE ~ "Other"
+    )
+  ) |>
+  select(outcome, predictor, effect_size, significance, outcome_group, model_type) |>
+  clean_names()
+```
+
+```{r heatmap_fixed_organ_order}
+# Fixed organ order to use across all heatmaps
+fixed_organ_order <- c(
+  "Brain", "Cardiovascular", "Kidney and Bladder", "Immune", "Liver",
+  "Adipose", "Endocrine", "Gastrointestinal", "Lung", "Muscle", 
+  "Nerve", "Pancreas", "Skin", "Ovary", "Prostate"
+)
+```
+
+```{r group_heatmaps}
+# Control variables for heatmap appearance
+HEATMAP_TEXT_SIZE <- 14
+HEATMAP_SQUARE_SIZE_DIVISOR <- 12
+
+# Function to create heatmap for specific outcome group
+create_group_heatmap <- function(data, group_name) {
+  group_data <- data |>
+    filter(outcome_group == group_name)
+
+  # Create consistent organ order
+  all_organs <- unique(group_data$predictor_clean)
+  all_organs <- all_organs[!is.na(all_organs)]
+  available_fixed <- intersect(fixed_organ_order, all_organs)
+  other_organs <- setdiff(all_organs, fixed_organ_order)
+  organ_order <- c(available_fixed, other_organs)
+
+  # Prepare matrix and cluster outcomes
+  group_matrix <- group_data |>
+    select(outcome_clean, predictor_clean, effect_size) |>
+    pivot_wider(
+      names_from = predictor_clean,
+      values_from = effect_size,
+      values_fill = 0
+    ) |>
+    column_to_rownames("outcome_clean") |>
+    as.matrix()
+
+  outcome_clusters <- hclust(dist(group_matrix), method = "ward.D2")
+  outcome_order <- rownames(group_matrix)[outcome_clusters$order]
+  available_organs <- intersect(organ_order, colnames(group_matrix))
+  predictor_order <- available_organs
+
+  if (length(outcome_order) == 0 || length(predictor_order) == 0) return(NULL)
+
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+
+  # Prepare data for plotting with numeric coordinates
+  group_data_clustered <- group_data |>
+    mutate(
+      outcome_clean = factor(outcome_clean, levels = outcome_order),
+      predictor_clean = factor(predictor_clean, levels = predictor_order),
+      outcome_num = (as.numeric(outcome_clean) - 1) * square_size + square_size/2,
+      predictor_num = (as.numeric(predictor_clean) - 1) * square_size + square_size/2,
+      effect_size_colored = if_else(significance != "", effect_size, NA_real_),
+      non_sig_marker = if_else(significance == "", "×", "")
+    )
+
+  # Set legend position for all plots
+  legend_pos <- "right"
+
+  # Create heatmap with panel styling
+  ggplot(group_data_clustered, aes(x = predictor_num, y = outcome_num, fill = effect_size_colored)) +
+    geom_tile(width = square_size, height = square_size, color = NA) +
+    geom_text(aes(x = predictor_num, y = outcome_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    scale_fill_gradientn(
+      colors = c(
+        "#2166AC",      # Blue for negative values
+        "white",        # White at zero
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(-0.5, 0, 0.25, 0.5)),
+      limits = c(-0.5, 0.5),
+      na.value = "white",
+      name = "Standardized\nEffect Size",
+      breaks = c(-0.5, -0.25, 0, 0.25, 0.5),
+      labels = c("-0.5", "-0.25", "0", "0.25", "0.5")
+    ) +
+    scale_x_continuous(
+      breaks = (seq_along(predictor_order) - 1) * square_size + square_size/2,
+      labels = predictor_order,
+      expand = c(0, 0),
+      limits = c(0, length(predictor_order) * square_size)
+    ) +
+    scale_y_continuous(
+      breaks = (seq_along(outcome_order) - 1) * square_size + square_size/2,
+      labels = outcome_order,
+      expand = c(0, 0),
+      limits = c(0, length(outcome_order) * square_size)
+    ) +
+    theme_minimal(base_family = "Helvetica") +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 12),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      legend.position = legend_pos,
+      legend.title = element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = unit(0.8, "cm"),
+      legend.key.width = unit(0.5, "cm"),
+      panel.grid = element_blank(),
+      panel.spacing = unit(0, "lines"),
+      panel.border = element_blank(),
+      plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    coord_fixed(ratio = 1, expand = FALSE)
+}
+
+# Create heatmaps for each group
+mortality_lifestyle_heatmap <- create_group_heatmap(mortality_heatmap_data, "Lifestyle")
+mortality_clinical_heatmap <- create_group_heatmap(mortality_heatmap_data, "Clinical Biomarkers")
+mortality_health_heatmap <- create_group_heatmap(mortality_heatmap_data, "Health")
+
+# Print heatmaps
+print(mortality_lifestyle_heatmap)
+print(mortality_clinical_heatmap)
+print(mortality_health_heatmap)
+
+# Save heatmaps to new structured paths
+save_plot(
+  filename = file.path(current_health_base, "heatmap", "mortality_organ_age_heatmap_lifestyle.svg"),
+  plot = mortality_lifestyle_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "heatmap", "mortality_organ_age_heatmap_clinical.svg"),
+  plot = mortality_clinical_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "heatmap", "mortality_organ_age_heatmap_health.svg"),
+  plot = mortality_health_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+
+# 8. Forest Tables for Clinical, Health, and Lifestyle Analyses
+
+```{r clinical_forest_helpers}
+create_forest_table <- function(data, outcome_name, main_color = "black") {
+  
+  forest_data <- data |> 
+    filter(outcome == outcome_name, organ_age_model == "mortality", is.na(error_message))
+  
+  if (nrow(forest_data) == 0) return(NULL)
+  
+  display_name <- case_when(
+    outcome_name == "whr" ~ "Waist-Hip Ratio",
+    outcome_name == "bmi" ~ "Body Mass Index", 
+    outcome_name == "edyrs" ~ "Education Years",
+    outcome_name == "glucose" ~ "Glucose",
+    outcome_name == "triglycerides" ~ "Triglycerides",
+    outcome_name == "hba1c" ~ "HbA1c",
+    outcome_name == "crp" ~ "C-Reactive Protein",
+    outcome_name == "total_hdl_ratio" ~ "Total/HDL Ratio",
+    outcome_name == "egfr_cr_cys" ~ "eGFR",
+    outcome_name == "fi_10" ~ "Frailty Index",
+    outcome_name == "telomere_length" ~ "Telomere Length",
+    outcome_name == "eversmok" ~ "Ever Smoked",
+    outcome_name == "exercise_how_often" ~ "Exercise Frequency",
+    TRUE ~ outcome_name
+  )
+  
+  is_binary <- all(forest_data$model_type == "logistic")
+  
+  forest_data <- forest_data |>
+    mutate(
+      effect_size = if_else(model_type == "linear", standardized_estimate, odds_ratio),
+      effect_lower = if_else(model_type == "linear", standardized_ci_lower, ci_lower),
+      effect_upper = if_else(model_type == "linear", standardized_ci_upper, ci_upper),
+      significant = FDR < 0.05,
+      errorbar_color = if_else(FDR < 0.05, "grey30", "gray80"),
+      Organ_Display = case_when(
+        predictor == "Brain" ~ "Brain",
+        predictor == "Heart" ~ "Heart", 
+        predictor == "Kidney" ~ "Kidney",
+        predictor == "Liver" ~ "Liver",
+        predictor == "Lung" ~ "Lung",
+        predictor == "Muscle" ~ "Muscle",
+        predictor == "Pancreas" ~ "Pancreas",
+        predictor == "Prostate" ~ "Prostate",
+        predictor == "Ovary" ~ "Ovary",
+        TRUE ~ predictor
+      )
+    ) |>
+    arrange(desc(effect_size)) |>
+    mutate(
+      y_pos = rev(seq_along(predictor)),
+      Organ_Display = factor(Organ_Display, levels = unique(Organ_Display))
+    )
+  
+  # Dynamic x-axis limits with hard caps
+  base_min <- 0.25
+  base_max <- 3
+  hard_min <- 0.05
+  hard_max <- 10
+  
+  if (is_binary) {
+    x_min <- suppressWarnings(min(forest_data$effect_lower, na.rm = TRUE))
+    x_max <- suppressWarnings(max(forest_data$effect_upper, na.rm = TRUE))
+    
+    if (!is.finite(x_min)) x_min <- base_min
+    if (!is.finite(x_max)) x_max <- base_max
+    
+    x_min <- max(x_min, 0.001)
+    
+    lower_margin_factor <- 0.9
+    upper_margin_factor <- 1.1
+    
+    x_min <- min(base_min, x_min * lower_margin_factor)
+    x_max <- max(base_max, x_max * upper_margin_factor)
+    
+    x_min <- max(hard_min, x_min)
+    x_max <- min(hard_max, x_max)
+  } else {
+    x_min <- suppressWarnings(min(forest_data$effect_lower, na.rm = TRUE))
+    x_max <- suppressWarnings(max(forest_data$effect_upper, na.rm = TRUE))
+    
+    if (!is.finite(x_min) || !is.finite(x_max)) {
+      x_min <- -0.5
+      x_max <- 0.5
+    }
+    
+    lower_margin_factor <- 1.1
+    upper_margin_factor <- 1.1
+    
+    x_min <- min(-0.5, x_min * lower_margin_factor)
+    x_max <- max(0.5, x_max * upper_margin_factor)
+    
+    x_min <- max(-hard_max, x_min)
+    x_max <- min(hard_max, x_max)
+  }
+  
+  x_breaks <- pretty(c(x_min, x_max), n = 6)
+  x_breaks <- x_breaks[x_breaks >= x_min & x_breaks <= x_max]
+  
+  # Add formatted effect size column and detect if scientific notation is needed
+  forest_data <- forest_data |>
+    mutate(
+      use_sci = pmax(abs(effect_size), abs(effect_lower), abs(effect_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      effect_formatted = if_else(
+        use_sci,
+        sprintf("%.1e (%.1e-%.1e)", effect_size, effect_lower, effect_upper),
+        sprintf("%.2f (%.2f-%.2f)", effect_size, effect_lower, effect_upper)
+      )
+    )
+  
+  # Detect if we need wider table for scientific notation
+  has_sci_notation <- any(forest_data$use_sci, na.rm = TRUE)
+  table_width_ratio <- if (has_sci_notation) 3.2 else 2.5
+  
+  # Create table data
+  tab <- forest_data |>
+    transmute(
+      y_pos, 
+      `Organ age` = Organ_Display, 
+      `Effect Size` = effect_formatted,
+      `FDR` = sprintf("%.2e", FDR)
+    )
+  
+  x_pos <- tibble(col = c("Organ age", "Effect Size", "FDR"), x = c(1.0, 4.0, 7.5))
+  table_long <- tab |>
+    pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    left_join(x_pos, by = "col")
+  
+  # Table plot
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3) +
+    geom_text(
+      data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), 
+      aes(x = x, y = y_pos, label = col), 
+      hjust = c(0, 0, 1), 
+      fontface = "bold", 
+      inherit.aes = FALSE, 
+      size = 3.3
+    ) +
+    scale_y_continuous(breaks = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 9.0), expand = c(0, 0)) +
+    labs(title = display_name) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(hjust = 0.1, size = 12), 
+      axis.title = element_blank(), 
+      axis.text = element_blank(), 
+      axis.ticks = element_blank(), 
+      panel.grid = element_blank(), 
+      plot.margin = unit(c(12, 6, 6, 6), "pt")
+    )
+  
+  # Determine which points are out of bounds and cap CIs to plot range
+  forest_data <- forest_data |>
+    mutate(
+      out_of_bounds_point = effect_size < x_min | effect_size > x_max,
+      effect_lower_capped = pmax(effect_lower, x_min),
+      effect_upper_capped = pmin(effect_upper, x_max),
+      has_any_value_outside = (effect_size < x_min | effect_size > x_max | effect_lower < x_min | effect_upper > x_max)
+    )
+  
+  # Only plot data where the effect size itself is within bounds
+  data_in_bounds <- forest_data |> filter(!out_of_bounds_point)
+  
+  # Calculate legend positions
+  legend_y <- max(forest_data$y_pos) + 1.5
+  legend_left_x <- x_min + (x_max - x_min) * 0.03
+  legend_right_x <- x_min + (x_max - x_min) * 0.60
+  legend_bottom_y <- 0.25
+  legend_bottom_x <- x_min + (x_max - x_min) * 0.60
+  
+  # Forest plot
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(
+      aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, 
+          fill = factor(seq_along(predictor) %% 2)), 
+      alpha = 0.6, show.legend = FALSE
+    ) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(
+      aes(x = if (is_binary) 1 else 0, xend = if (is_binary) 1 else 0, 
+          y = 0.5, yend = max(forest_data$y_pos) + 0.75), 
+      linetype = "33", color = "grey10", size = 0.7
+    ) +
+    {if (nrow(data_in_bounds) > 0) geom_errorbarh(data = data_in_bounds, aes(xmin = effect_lower_capped, xmax = effect_upper_capped, y = y_pos), color = data_in_bounds$errorbar_color, height = 0.15, size = 0.6, inherit.aes = FALSE)} +
+    {if (nrow(data_in_bounds) > 0) geom_point(data = data_in_bounds, aes(x = effect_size, color = significant), size = 2.5, shape = 16)} +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) geom_text(data = data_in_bounds |> filter(has_any_value_outside), aes(x = effect_size, y = y_pos + 0.25), label = "*", size = 3.5, color = "black")} +
+    annotate(
+      "text", x = legend_left_x, y = legend_y, 
+      label = "● Significant (FDR < 0.05)", hjust = 0, size = 2.6, color = main_color
+    ) +
+    annotate(
+      "text", x = legend_right_x, y = legend_y, 
+      label = "● Non-significant", hjust = 0, size = 2.6, color = "gray80"
+    ) +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) annotate("text", x = legend_bottom_x, y = legend_bottom_y, label = "* Value outside plot range", hjust = 1, size = 2.4, color = "black")} +
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(
+      limits = c(x_min, x_max),
+      breaks = x_breaks,
+      labels = format(x_breaks, digits = 3, trim = TRUE)
+    ) +
+    scale_y_continuous(breaks = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = if (is_binary) "Odds Ratio (95% CI)" else "Standardized Effect (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.y = element_blank(), 
+      axis.text.x = element_text(size = 9), 
+      axis.title.x = element_text(size = 10), 
+      panel.grid.major.y = element_blank(), 
+      panel.grid.minor = element_blank(), 
+      panel.grid.major.x = element_blank(), 
+      plot.margin = unit(c(12, 12, 6, 0), "pt"), 
+      legend.position = "none"
+    ) +
+    coord_cartesian(clip = "off")
+  
+  p_table + p_forest + plot_layout(widths = c(table_width_ratio, 2))
+}
+```
+
+```{r create_and_save_forest_plots}
+# Create output directory
+output_dir <- file.path(current_health_base, "forest_table")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Define all outcomes to plot
+all_outcomes <- c(lifestyle_outcomes, clinical_biomarkers, health_outcomes, binary_outcomes)
+
+# Create and save forest plots
+for (outcome_name in all_outcomes) {
+  plot <- create_forest_table(all_results, outcome_name)
+  
+  if (!is.null(plot)) {
+    save_plot(
+      filename = file.path(output_dir, paste0("forest_", outcome_name, ".svg")),
+      plot = plot,
+      width = 8,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+
+# Create CSV tables directory
+csv_dir <- file.path(current_health_base, "tables")
+dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Save table data as CSV for all outcomes
+for (outcome_name in all_outcomes) {
+  outcome_data <- all_results |> 
+    filter(outcome == outcome_name, organ_age_model == "mortality", is.na(error_message))
+  
+  if (nrow(outcome_data) == 0) next
+  
+  # Create table data
+  tab <- outcome_data |>
+    mutate(
+      effect_size = if_else(model_type == "linear", standardized_estimate, odds_ratio),
+      effect_lower = if_else(model_type == "linear", standardized_ci_lower, ci_lower),
+      effect_upper = if_else(model_type == "linear", standardized_ci_upper, ci_upper),
+      use_sci = pmax(abs(effect_size), abs(effect_lower), abs(effect_upper), na.rm = TRUE) >= 10,
+      effect_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", effect_size, effect_lower, effect_upper),
+        sprintf("%.2f (%.2f-%.2f)", effect_size, effect_lower, effect_upper)),
+      Organ_Display = case_when(
+        predictor == "Brain" ~ "Brain",
+        predictor == "Heart" ~ "Heart",
+        predictor == "Kidney" ~ "Kidney",
+        predictor == "Liver" ~ "Liver",
+        predictor == "Lung" ~ "Lung",
+        predictor == "Muscle" ~ "Muscle",
+        predictor == "Pancreas" ~ "Pancreas",
+        predictor == "Prostate" ~ "Prostate",
+        predictor == "Ovary" ~ "Ovary",
+        TRUE ~ predictor
+      )
+    ) |>
+    select(Organ = Organ_Display, `Effect Size (95% CI)` = effect_formatted, FDR)
+  
+  write.csv(tab, file = file.path(csv_dir, paste0(outcome_name, ".csv")), row.names = FALSE)
+}
+```
+
+# 9. Sex-Stratified Analyses
+
+```{r sex_stratified_analyses}
+# Create sex-stratified datasets
+twins_analysis_male <- twins_analysis |> filter(sex == 1)
+twins_analysis_female <- twins_analysis |> filter(sex == 2)
+
+# Temporarily replace the main dataset for sex-specific analyses
+run_sex_stratified <- function(sex_value, sex_label) {
+  # Temporarily override twins_analysis in the function environment
+  twins_analysis_temp <- twins_analysis
+  assign("twins_analysis", if(sex_value == 1) twins_analysis_male else twins_analysis_female, envir = .GlobalEnv)
+  
+  # Run analyses
+  cont_results <- analyze_continuous_outcomes(organ_age_mortality) |>
+    mutate(model_type = "linear", organ_age_model = "mortality", sex_strata = sex_label)
+  
+  binary_results <- analyze_binary_outcomes(organ_age_mortality) |>
+    mutate(model_type = "logistic", organ_age_model = "mortality", sex_strata = sex_label)
+  
+  # Restore original dataset
+  assign("twins_analysis", twins_analysis_temp, envir = .GlobalEnv)
+  
+  bind_rows(cont_results, binary_results)
+}
+
+# Run for males and females
+male_results <- run_sex_stratified(1, "Male")
+female_results <- run_sex_stratified(2, "Female")
+
+all_sex_stratified_results <- bind_rows(male_results, female_results)
+```
+
+```{r sex_stratified_heatmaps}
+# Prepare heatmap data for each sex
+male_heatmap_data <- male_results |>
+  filter(organ_age_model == "mortality", is.na(error_message)) |>
+  mutate(
+    effect_size = case_when(
+      model_type == "linear" ~ standardized_estimate,
+      model_type == "logistic" ~ log(odds_ratio)
+    ),
+    significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01 ~ "**",
+      FDR < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    outcome_group = case_when(
+      outcome %in% lifestyle_outcomes ~ "Lifestyle",
+      outcome %in% clinical_biomarkers ~ "Clinical Biomarkers",
+      outcome %in% health_outcomes ~ "Health",
+      outcome %in% binary_outcomes ~ "Lifestyle",
+      TRUE ~ "Other"
+    )
+  ) |>
+  select(outcome, predictor, effect_size, significance, outcome_group, model_type) |>
+  clean_names()
+
+female_heatmap_data <- female_results |>
+  filter(organ_age_model == "mortality", is.na(error_message)) |>
+  mutate(
+    effect_size = case_when(
+      model_type == "linear" ~ standardized_estimate,
+      model_type == "logistic" ~ log(odds_ratio)
+    ),
+    significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01 ~ "**",
+      FDR < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    outcome_group = case_when(
+      outcome %in% lifestyle_outcomes ~ "Lifestyle",
+      outcome %in% clinical_biomarkers ~ "Clinical Biomarkers",
+      outcome %in% health_outcomes ~ "Health",
+      outcome %in% binary_outcomes ~ "Lifestyle",
+      TRUE ~ "Other"
+    )
+  ) |>
+  select(outcome, predictor, effect_size, significance, outcome_group, model_type) |>
+  clean_names()
+
+# Create heatmaps for each group and sex
+male_lifestyle_heatmap <- create_group_heatmap(male_heatmap_data, "Lifestyle")
+male_clinical_heatmap <- create_group_heatmap(male_heatmap_data, "Clinical Biomarkers")
+male_health_heatmap <- create_group_heatmap(male_heatmap_data, "Health")
+
+female_lifestyle_heatmap <- create_group_heatmap(female_heatmap_data, "Lifestyle")
+female_clinical_heatmap <- create_group_heatmap(female_heatmap_data, "Clinical Biomarkers")
+female_health_heatmap <- create_group_heatmap(female_heatmap_data, "Health")
+
+# Save heatmaps
+save_plot(
+  filename = file.path(current_health_base, "sex_stratified", "heatmap", "male_lifestyle.svg"),
+  plot = male_lifestyle_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "sex_stratified", "heatmap", "male_clinical.svg"),
+  plot = male_clinical_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "sex_stratified", "heatmap", "male_health.svg"),
+  plot = male_health_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "sex_stratified", "heatmap", "female_lifestyle.svg"),
+  plot = female_lifestyle_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "sex_stratified", "heatmap", "female_clinical.svg"),
+  plot = female_clinical_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "sex_stratified", "heatmap", "female_health.svg"),
+  plot = female_health_heatmap,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r sex_stratified_forest_tables}
+# Create output directory
+output_dir_sex <- file.path(current_health_base, "sex_stratified", "forest_table")
+dir.create(output_dir_sex, showWarnings = FALSE, recursive = TRUE)
+
+# Define all outcomes
+all_outcomes <- c(lifestyle_outcomes, clinical_biomarkers, health_outcomes, binary_outcomes)
+
+# Create and save forest tables for each sex and outcome
+for (sex_label in c("Male", "Female")) {
+  sex_data <- all_sex_stratified_results |> filter(sex_strata == sex_label)
+  
+  for (outcome_name in all_outcomes) {
+    # Filter for this outcome
+    outcome_data <- sex_data |> 
+      filter(outcome == outcome_name, is.na(error_message))
+    
+    if (nrow(outcome_data) == 0) next
+    
+    # Determine display name
+    display_name <- case_when(
+      outcome_name == "whr" ~ "Waist-Hip Ratio",
+      outcome_name == "bmi" ~ "Body Mass Index", 
+      outcome_name == "edyrs" ~ "Education Years",
+      outcome_name == "glucose" ~ "Glucose",
+      outcome_name == "triglycerides" ~ "Triglycerides",
+      outcome_name == "hba1c" ~ "HbA1c",
+      outcome_name == "crp" ~ "C-Reactive Protein",
+      outcome_name == "total_hdl_ratio" ~ "Total/HDL Ratio",
+      outcome_name == "egfr_cr_cys" ~ "eGFR",
+      outcome_name == "fi_10" ~ "Frailty Index",
+      outcome_name == "telomere_length" ~ "Telomere Length",
+      outcome_name == "eversmok" ~ "Ever Smoked",
+      outcome_name == "exercise_how_often" ~ "Exercise Frequency",
+      TRUE ~ outcome_name
+    )
+    
+    title <- paste0(display_name, " - ", sex_label, "s")
+    
+    # Create forest table (reusing the same create_forest_table logic)
+    is_binary <- all(outcome_data$model_type == "logistic")
+    
+    forest_data <- outcome_data |>
+      mutate(
+        effect_size = if_else(model_type == "linear", standardized_estimate, odds_ratio),
+        effect_lower = if_else(model_type == "linear", standardized_ci_lower, ci_lower),
+        effect_upper = if_else(model_type == "linear", standardized_ci_upper, ci_upper),
+        significant = FDR < 0.05,
+        Organ_Display = case_when(
+          predictor == "Brain" ~ "Brain",
+          predictor == "Heart" ~ "Heart", 
+          predictor == "Kidney" ~ "Kidney",
+          predictor == "Liver" ~ "Liver",
+          predictor == "Lung" ~ "Lung",
+          predictor == "Muscle" ~ "Muscle",
+          predictor == "Pancreas" ~ "Pancreas",
+          predictor == "Prostate" ~ "Prostate",
+          predictor == "Ovary" ~ "Ovary",
+          TRUE ~ predictor
+        )
+      ) |>
+      arrange(desc(effect_size)) |>
+      mutate(
+        y_pos = rev(seq_along(predictor)),
+        Organ_Display = factor(Organ_Display, levels = unique(Organ_Display))
+      )
+    
+    if (nrow(forest_data) == 0) next
+    
+    # Determine x-axis limits
+    if (is_binary) {
+      x_min <- min(forest_data$effect_lower, na.rm = TRUE)
+      x_max <- max(forest_data$effect_upper, na.rm = TRUE)
+      pad <- 0.1 * (x_max - x_min)
+      x_limits <- c(max(0.1, min(0.5, x_min - pad)), max(1.5, x_max + pad))
+    } else {
+      x_min <- min(forest_data$effect_lower, na.rm = TRUE)
+      x_max <- max(forest_data$effect_upper, na.rm = TRUE)
+      pad <- 0.1 * (x_max - x_min)
+      x_limits <- c(min(-0.5, x_min - pad), max(0.5, x_max + pad))
+    }
+    
+    legend_x_left <- x_limits[1] + 0.05 * (x_limits[2] - x_limits[1])
+    legend_x_right <- x_limits[1] + 0.55 * (x_limits[2] - x_limits[1])
+    
+    # Create table data
+    tab <- forest_data |>
+      transmute(
+        y_pos, 
+        `Organ age` = Organ_Display, 
+        `Effect Size` = sprintf("%.2f (%.2f-%.2f)", effect_size, effect_lower, effect_upper),
+        `FDR` = sprintf("%.2e", FDR)
+      )
+    
+    x_pos <- tibble(col = c("Organ age", "Effect Size", "FDR"), x = c(1.0, 3.5, 6.0))
+    table_long <- tab |>
+      pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+      left_join(x_pos, by = "col")
+    
+    # Table plot
+    p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+      geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3.2) +
+      geom_text(
+        data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), 
+        aes(x = x, y = y_pos, label = col), 
+        hjust = c(0, 0, 1), 
+        fontface = "bold", 
+        inherit.aes = FALSE, 
+        size = 3.3
+      ) +
+      scale_y_continuous(breaks = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+      scale_x_continuous(limits = c(0.5, 7.0), expand = c(0, 0)) +
+      labs(title = title) +
+      theme_minimal(base_size = 11) +
+      theme(
+        plot.title = element_text(hjust = 0.1, size = 12), 
+        axis.title = element_blank(), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.grid = element_blank(), 
+        plot.margin = unit(c(12, 6, 6, 6), "pt")
+      )
+    
+    # Forest plot
+    p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+      geom_rect(
+        aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, 
+            fill = factor(seq_along(predictor) %% 2)), 
+        alpha = 0.6, show.legend = FALSE
+      ) +
+      scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+      geom_segment(
+        aes(x = if (is_binary) 1 else 0, xend = if (is_binary) 1 else 0, 
+            y = 0.5, yend = max(forest_data$y_pos) + 0.75), 
+        linetype = "33", color = "grey10", size = 0.7
+      ) +
+      geom_errorbarh(
+        aes(xmin = effect_lower, xmax = effect_upper, color = significant), 
+        height = 0.15, size = 0.6
+      ) +
+      geom_point(aes(x = effect_size, color = significant), size = 2.5, shape = 16) +
+      annotate(
+        "text", x = legend_x_left, y = max(forest_data$y_pos) + 1.5, 
+        label = "● Significant (FDR < 0.05)", hjust = 0.35, size = 3, color = "black"
+      ) +
+      annotate(
+        "text", x = legend_x_right, y = max(forest_data$y_pos) + 1.5, 
+        label = "● Non-significant", hjust = -0.65, size = 3, color = "gray80"
+      ) +
+      scale_color_manual(values = c("TRUE" = "black", "FALSE" = "gray80")) +
+      scale_x_continuous(limits = x_limits, expand = c(0, 0)) +
+      scale_y_continuous(breaks = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+      labs(x = if (is_binary) "Odds Ratio (95% CI)" else "Standardized Effect (95% CI)", y = NULL) +
+      theme_minimal(base_size = 11) +
+      theme(
+        axis.text.y = element_blank(), 
+        axis.text.x = element_text(size = 9), 
+        axis.title.x = element_text(size = 10), 
+        panel.grid.major.y = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.grid.major.x = element_blank(), 
+        plot.margin = unit(c(12, 12, 6, 0), "pt"), 
+        legend.position = "none"
+      ) +
+      coord_cartesian(clip = "off")
+    
+    plot_combined <- p_table + p_forest + plot_layout(widths = c(2.5, 2))
+    
+    # Save plot
+    save_plot(
+      filename = file.path(output_dir_sex, paste0("forest_", tolower(sex_label), "_", outcome_name, ".svg")),
+      plot = plot_combined,
+      width = 8,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+
+# Create CSV tables directory for sex-stratified results
+csv_dir_sex <- file.path(current_health_base, "sex_stratified", "tables")
+dir.create(csv_dir_sex, showWarnings = FALSE, recursive = TRUE)
+
+# Save table data as CSV for sex-stratified analyses
+for (sex_label in c("Male", "Female")) {
+  sex_data <- all_sex_stratified_results |> filter(sex_strata == sex_label)
+  
+  for (outcome_name in all_outcomes) {
+    outcome_data <- sex_data |> 
+      filter(outcome == outcome_name, is.na(error_message))
+    
+    if (nrow(outcome_data) == 0) next
+    
+    tab <- outcome_data |>
+      mutate(
+        effect_size = if_else(model_type == "linear", standardized_estimate, odds_ratio),
+        effect_lower = if_else(model_type == "linear", standardized_ci_lower, ci_lower),
+        effect_upper = if_else(model_type == "linear", standardized_ci_upper, ci_upper),
+        use_sci = pmax(abs(effect_size), abs(effect_lower), abs(effect_upper), na.rm = TRUE) >= 10,
+        effect_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", effect_size, effect_lower, effect_upper),
+          sprintf("%.2f (%.2f-%.2f)", effect_size, effect_lower, effect_upper)),
+        Organ_Display = case_when(
+          predictor == "Brain" ~ "Brain",
+          predictor == "Heart" ~ "Heart",
+          predictor == "Kidney" ~ "Kidney",
+          predictor == "Liver" ~ "Liver",
+          predictor == "Lung" ~ "Lung",
+          predictor == "Muscle" ~ "Muscle",
+          predictor == "Pancreas" ~ "Pancreas",
+          predictor == "Prostate" ~ "Prostate",
+          predictor == "Ovary" ~ "Ovary",
+          TRUE ~ predictor
+        )
+      ) |>
+      select(Organ = Organ_Display, `Effect Size (95% CI)` = effect_formatted, FDR)
+    
+    filename <- paste0(tolower(sex_label), "_", outcome_name, ".csv")
+    write.csv(tab, file = file.path(csv_dir_sex, filename), row.names = FALSE)
+  }
+}
+```
+
+## Smoking Discordant Twin Analysis
+
+```{r smoking_discordant_helpers}
+run_smoking_discordant <- function(predictor_df, mz_only = FALSE) {
+  predictors <- setdiff(colnames(predictor_df), "twin_id")
+  
+  discordant_twins <- twins_analysis |>
+    group_by(pair_id) |>
+    filter(
+      n() == 2,
+      if (mz_only) all(bestzyg == 1) else TRUE,
+      sum(eversmok == 1, na.rm = TRUE) == 1
+    ) |>
+    ungroup()
+  
+  map_dfr(predictors, function(pred) {
+    df <- discordant_twins |>
+      left_join(predictor_df |> select(twin_id, all_of(pred)), by = "twin_id") |>
+      filter(!is.na(.data[[pred]]))
+    
+    if (pred %in% c("Ovary", "Prostate")) {
+      df <- df |> filter(sex == if (pred == "Ovary") 2 else 1)
+    }
+    
+    if (n_distinct(df$pair_id) < 3) {
+      return(tibble(predictor = pred, estimate = NA_real_, std_error = NA_real_,
+                   p_value = NA_real_, odds_ratio = NA_real_, ci_lower = NA_real_,
+                   ci_upper = NA_real_, error_message = "Insufficient pairs"))
+    }
+    
+    tryCatch({
+      fit <- clogit(as.formula(paste0("eversmok ~ scale(`", pred, "`) + strata(pair_id)")), data = df)
+      est <- as.numeric(coef(fit)[1])
+      se <- sqrt(diag(vcov(fit)))[1]
+      p <- summary(fit)$coefficients[1, "Pr(>|z|)"]
+      
+      tibble(
+        predictor = pred,
+        estimate = est,
+        std_error = se,
+        p_value = as.numeric(p),
+        odds_ratio = exp(est),
+        ci_lower = exp(est - 1.96 * se),
+        ci_upper = exp(est + 1.96 * se),
+        error_message = NA_character_
+      )
+    }, error = function(e) {
+      tibble(predictor = pred, estimate = NA_real_, std_error = NA_real_,
+             p_value = NA_real_, odds_ratio = NA_real_, ci_lower = NA_real_,
+             ci_upper = NA_real_, error_message = e$message)
+    })
+  }) |>
+    mutate(FDR = p.adjust(p_value, method = "fdr"))
+}
+```
+
+```{r smoking_discordant_results}
+smoking_discordant_all <- run_smoking_discordant(organ_age_mortality, mz_only = FALSE) |>
+  mutate(analysis = "All discordant pairs")
+
+smoking_discordant_mz <- run_smoking_discordant(organ_age_mortality, mz_only = TRUE) |>
+  mutate(analysis = "MZ discordant pairs")
+```
+
+## Exercise Discordant Twin Analysis
+
+```{r exercise_discordant_helpers}
+run_exercise_discordant <- function(predictor_df, mz_only = FALSE) {
+  predictors <- setdiff(colnames(predictor_df), "twin_id")
+  
+  discordant_twins <- twins_analysis |>
+    group_by(pair_id) |>
+    filter(
+      n() == 2,
+      if (mz_only) all(bestzyg == 1) else TRUE,
+      sum(exercise_how_often == 1, na.rm = TRUE) == 1
+    ) |>
+    ungroup()
+  
+  map_dfr(predictors, function(pred) {
+    df <- discordant_twins |>
+      left_join(predictor_df |> select(twin_id, all_of(pred)), by = "twin_id") |>
+      filter(!is.na(.data[[pred]]))
+    
+    if (pred %in% c("Ovary", "Prostate")) {
+      df <- df |> filter(sex == if (pred == "Ovary") 2 else 1)
+    }
+    
+    if (n_distinct(df$pair_id) < 3) {
+      return(tibble(predictor = pred, estimate = NA_real_, std_error = NA_real_,
+                   p_value = NA_real_, odds_ratio = NA_real_, ci_lower = NA_real_,
+                   ci_upper = NA_real_, error_message = "Insufficient pairs"))
+    }
+    
+    tryCatch({
+      fit <- clogit(as.formula(paste0("exercise_how_often ~ scale(`", pred, "`) + strata(pair_id)")), data = df)
+      est <- as.numeric(coef(fit)[1])
+      se <- sqrt(diag(vcov(fit)))[1]
+      p <- summary(fit)$coefficients[1, "Pr(>|z|)"]
+      
+      tibble(
+        predictor = pred,
+        estimate = est,
+        std_error = se,
+        p_value = as.numeric(p),
+        odds_ratio = exp(est),
+        ci_lower = exp(est - 1.96 * se),
+        ci_upper = exp(est + 1.96 * se),
+        error_message = NA_character_
+      )
+    }, error = function(e) {
+      tibble(predictor = pred, estimate = NA_real_, std_error = NA_real_,
+             p_value = NA_real_, odds_ratio = NA_real_, ci_lower = NA_real_,
+             ci_upper = NA_real_, error_message = e$message)
+    })
+  }) |>
+    mutate(FDR = p.adjust(p_value, method = "fdr"))
+}
+```
+
+```{r exercise_discordant_results}
+exercise_discordant_all <- run_exercise_discordant(organ_age_mortality, mz_only = FALSE) |>
+  mutate(analysis = "All discordant pairs")
+
+exercise_discordant_mz <- run_exercise_discordant(organ_age_mortality, mz_only = TRUE) |>
+  mutate(analysis = "MZ discordant pairs")
+```
+
+```{r transform_discordant_for_within_pair}
+# Transform discordant results to match within-pair structure for harmonized output
+# Smoking - All Pairs
+smoking_within_pair_all <- smoking_discordant_all |>
+  mutate(
+    outcome = "eversmok",
+    standardized_estimate = log(odds_ratio),
+    standardized_ci_lower = log(ci_lower),
+    standardized_ci_upper = log(ci_upper),
+    model_type = "logistic",
+    organ_age_model = "mortality",
+    analysis_type = "within_pair",
+    pair_type = "all"
+  )
+
+# Smoking - MZ Pairs
+smoking_within_pair_mz <- smoking_discordant_mz |>
+  mutate(
+    outcome = "eversmok",
+    standardized_estimate = log(odds_ratio),
+    standardized_ci_lower = log(ci_lower),
+    standardized_ci_upper = log(ci_upper),
+    model_type = "logistic",
+    organ_age_model = "mortality",
+    analysis_type = "within_pair",
+    pair_type = "mz"
+  )
+
+# Exercise - All Pairs
+exercise_within_pair_all <- exercise_discordant_all |>
+  mutate(
+    outcome = "exercise_how_often",
+    standardized_estimate = log(odds_ratio),
+    standardized_ci_lower = log(ci_lower),
+    standardized_ci_upper = log(ci_upper),
+    model_type = "logistic",
+    organ_age_model = "mortality",
+    analysis_type = "within_pair",
+    pair_type = "all"
+  )
+
+# Exercise - MZ Pairs
+exercise_within_pair_mz <- exercise_discordant_mz |>
+  mutate(
+    outcome = "exercise_how_often",
+    standardized_estimate = log(odds_ratio),
+    standardized_ci_lower = log(ci_lower),
+    standardized_ci_upper = log(ci_upper),
+    model_type = "logistic",
+    organ_age_model = "mortality",
+    analysis_type = "within_pair",
+    pair_type = "mz"
+  )
+```
+
+```{r discordant_forest_helpers}
+create_discordant_forest_table <- function(data, title, n_pairs, main_color = "black") {
+  
+  forest_data <- data |> 
+    filter(is.na(error_message))
+  
+  if (nrow(forest_data) == 0) return(NULL)
+  
+  # Add n_pairs to title
+  title_with_n <- paste0(title, " (n=", n_pairs, " pairs)")
+  
+  forest_data <- forest_data |>
+    mutate(
+      significant = FDR < 0.05,
+      Organ_Display = case_when(
+        predictor == "Brain" ~ "Brain",
+        predictor == "Heart" ~ "Heart", 
+        predictor == "Kidney" ~ "Kidney",
+        predictor == "Liver" ~ "Liver",
+        predictor == "Lung" ~ "Lung",
+        predictor == "Muscle" ~ "Muscle",
+        predictor == "Pancreas" ~ "Pancreas",
+        predictor == "Prostate" ~ "Prostate",
+        predictor == "Ovary" ~ "Ovary",
+        TRUE ~ predictor
+      )
+    ) |>
+    arrange(desc(odds_ratio)) |>
+    mutate(
+      y_pos = rev(seq_along(predictor)),
+      Organ_Display = factor(Organ_Display, levels = unique(Organ_Display))
+    )
+  
+  x_min <- min(forest_data$ci_lower, na.rm = TRUE)
+  x_max <- max(forest_data$ci_upper, na.rm = TRUE)
+  pad <- 0.1 * (x_max - x_min)
+  x_limits <- c(max(0.1, min(0.5, x_min - pad)), max(1.5, x_max + pad))
+  
+  legend_x_left <- x_limits[1] + 0.05 * (x_limits[2] - x_limits[1])
+  legend_x_right <- x_limits[1] + 0.55 * (x_limits[2] - x_limits[1])
+  
+  tab <- forest_data |>
+    transmute(
+      y_pos, 
+      `Organ age` = Organ_Display, 
+      `Effect Size` = sprintf("%.2f (%.2f-%.2f)", odds_ratio, ci_lower, ci_upper),
+      `FDR` = sprintf("%.2e", FDR)
+    )
+  
+  x_pos <- tibble(col = c("Organ age", "Effect Size", "FDR"), x = c(1.0, 3.5, 6.0))
+  table_long <- tab |>
+    pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    left_join(x_pos, by = "col")
+  
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3.2) +
+    geom_text(
+      data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), 
+      aes(x = x, y = y_pos, label = col), 
+      hjust = c(0, 0, 1), 
+      fontface = "bold", 
+      inherit.aes = FALSE, 
+      size = 3.3
+    ) +
+    scale_y_continuous(breaks = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 7.0), expand = c(0, 0)) +
+    labs(title = title_with_n) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(hjust = 0.1, size = 12), 
+      axis.title = element_blank(), 
+      axis.text = element_blank(), 
+      axis.ticks = element_blank(), 
+      panel.grid = element_blank(), 
+      plot.margin = unit(c(12, 6, 6, 6), "pt")
+    )
+  
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(
+      aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, 
+          fill = factor(seq_along(predictor) %% 2)), 
+      alpha = 0.6, show.legend = FALSE
+    ) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(
+      aes(x = 1, xend = 1, y = 0.5, yend = max(forest_data$y_pos) + 0.75), 
+      linetype = "33", color = "grey10", size = 0.7
+    ) +
+    geom_errorbarh(
+      aes(xmin = ci_lower, xmax = ci_upper, color = significant), 
+      height = 0.15, size = 0.6
+    ) +
+    geom_point(aes(x = odds_ratio, color = significant), size = 2.5, shape = 16) +
+    annotate(
+      "text", x = legend_x_left, y = max(forest_data$y_pos) + 1.5, 
+      label = "● Significant (FDR < 0.05)", hjust = 0.35, size = 3, color = main_color
+    ) +
+    annotate(
+      "text", x = legend_x_right, y = max(forest_data$y_pos) + 1.5, 
+      label = "● Non-significant", hjust = -0.65, size = 3, color = "gray80"
+    ) +
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(limits = x_limits, expand = c(0, 0)) +
+    scale_y_continuous(breaks = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Odds Ratio (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.y = element_blank(), 
+      axis.text.x = element_text(size = 9), 
+      axis.title.x = element_text(size = 10), 
+      panel.grid.major.y = element_blank(), 
+      panel.grid.minor = element_blank(), 
+      panel.grid.major.x = element_blank(), 
+      plot.margin = unit(c(12, 12, 6, 0), "pt"), 
+      legend.position = "none"
+    ) +
+    coord_cartesian(clip = "off")
+  
+  p_table + p_forest + plot_layout(widths = c(2.5, 2))
+}
+```
+
+```{r calculate_discordant_pair_counts}
+# Calculate number of discordant pairs for focused forest tables
+n_smoking_all <- twins_analysis |>
+  group_by(pair_id) |>
+  filter(n() == 2, sum(eversmok == 1, na.rm = TRUE) == 1) |>
+  summarise() |>
+  nrow()
+
+n_smoking_mz <- twins_analysis |>
+  group_by(pair_id) |>
+  filter(n() == 2, all(bestzyg == 1), sum(eversmok == 1, na.rm = TRUE) == 1) |>
+  summarise() |>
+  nrow()
+```
+
+```{r create_focused_forest_table}
+create_focused_discordant_forest_table <- function(data, title, n_pairs, main_color = "black") {
+  
+  forest_data <- data |> 
+    filter(is.na(error_message)) |>
+    filter(predictor %in% c("Lung", "Gastrointestinal_tract", "Kidney_urinary"))
+  
+  if (nrow(forest_data) == 0) return(NULL)
+  
+  # Add n_pairs to title
+  title_with_n <- paste0(title, " (n=", n_pairs, " pairs)")
+  
+  forest_data <- forest_data |>
+    mutate(
+      significant = FDR < 0.05,
+      Organ_Display = case_when(
+        predictor == "Lung" ~ "Lung",
+        predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+        TRUE ~ predictor
+      )
+    ) |>
+    arrange(desc(odds_ratio)) |>
+    mutate(
+      y_pos = rev(seq_along(predictor)),
+      Organ_Display = factor(Organ_Display, levels = unique(Organ_Display))
+    )
+  
+  x_min <- min(forest_data$ci_lower, na.rm = TRUE)
+  x_max <- max(forest_data$ci_upper, na.rm = TRUE)
+  pad <- 0.1 * (x_max - x_min)
+  x_limits <- c(max(0.1, min(0.5, x_min - pad)), max(1.5, x_max + pad))
+  
+  legend_x_left <- x_limits[1] + 0.05 * (x_limits[2] - x_limits[1])
+  legend_x_right <- x_limits[1] + 0.55 * (x_limits[2] - x_limits[1])
+  
+  tab <- forest_data |>
+    transmute(
+      y_pos, 
+      `Organ age` = Organ_Display, 
+      `Effect Size` = sprintf("%.2f (%.2f-%.2f)", odds_ratio, ci_lower, ci_upper),
+      `FDR` = sprintf("%.2e", FDR)
+    )
+  
+  x_pos <- tibble(col = c("Organ age", "Effect Size", "FDR"), x = c(1.0, 3.5, 6.0))
+  table_long <- tab |>
+    pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    left_join(x_pos, by = "col")
+  
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3.2) +
+    geom_text(
+      data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), 
+      aes(x = x, y = y_pos, label = col), 
+      hjust = c(0, 0, 1), 
+      fontface = "bold", 
+      inherit.aes = FALSE, 
+      size = 3.3
+    ) +
+    scale_y_continuous(breaks = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 7.0), expand = c(0, 0)) +
+    labs(title = title_with_n) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(hjust = 0.1, size = 12), 
+      axis.title = element_blank(), 
+      axis.text = element_blank(), 
+      axis.ticks = element_blank(), 
+      panel.grid = element_blank(), 
+      plot.margin = unit(c(12, 6, 6, 6), "pt")
+    )
+  
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(
+      aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, 
+          fill = factor(seq_along(predictor) %% 2)), 
+      alpha = 0.6, show.legend = FALSE
+    ) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(
+      aes(x = 1, xend = 1, y = 0.5, yend = max(forest_data$y_pos) + 0.75), 
+      linetype = "33", color = "grey10", size = 0.7
+    ) +
+    geom_errorbarh(
+      aes(xmin = ci_lower, xmax = ci_upper, color = significant), 
+      height = 0.15, size = 0.6
+    ) +
+    geom_point(aes(x = odds_ratio, color = significant), size = 2.5, shape = 16) +
+    annotate(
+      "text", x = legend_x_left, y = max(forest_data$y_pos) + 1.5, 
+      label = "● Significant (FDR < 0.05)", hjust = 0.35, size = 3, color = main_color
+    ) +
+    annotate(
+      "text", x = legend_x_right, y = max(forest_data$y_pos) + 1.5, 
+      label = "● Non-significant", hjust = -0.65, size = 3, color = "gray80"
+    ) +
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(limits = x_limits, expand = c(0, 0)) +
+    scale_y_continuous(breaks = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Odds Ratio (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.y = element_blank(), 
+      axis.text.x = element_text(size = 9), 
+      axis.title.x = element_text(size = 10), 
+      panel.grid.major.y = element_blank(), 
+      panel.grid.minor = element_blank(), 
+      panel.grid.major.x = element_blank(), 
+      plot.margin = unit(c(12, 12, 6, 0), "pt"), 
+      legend.position = "none"
+    ) +
+    coord_cartesian(clip = "off")
+  
+  p_table + p_forest + plot_layout(widths = c(2.5, 2))
+}
+```
+
+```{r create_focused_smoking_forest_tables}
+# Create focused forest tables for smoking results (lung, gastrointestinal, kidney/bladder only)
+output_dir_focused <- file.path(current_health_base, "discordant", "forest_table")
+dir.create(output_dir_focused, showWarnings = FALSE, recursive = TRUE)
+
+focused_forest_tables <- list(
+  smoking_all_focused = create_focused_discordant_forest_table(smoking_discordant_all, "Smoking - All Discordant Pairs (Focused)", n_smoking_all),
+  smoking_mz_focused = create_focused_discordant_forest_table(smoking_discordant_mz, "Smoking - MZ Discordant Pairs (Focused)", n_smoking_mz)
+)
+
+for (name in names(focused_forest_tables)) {
+  if (!is.null(focused_forest_tables[[name]])) {
+    save_plot(
+      filename = file.path(output_dir_focused, paste0("forest_", name, ".svg")),
+      plot = focused_forest_tables[[name]],
+      width = 8,
+      height = 4,
+      dpi = 300
+    )
+  }
+}
+
+# Create CSV tables directory for focused discordant results
+csv_dir_focused <- file.path(current_health_base, "discordant", "tables")
+dir.create(csv_dir_focused, showWarnings = FALSE, recursive = TRUE)
+
+# Save CSV for focused smoking - all pairs
+smoking_all_data <- smoking_discordant_all |>
+  filter(is.na(error_message), predictor %in% c("Lung", "Gastrointestinal_tract", "Kidney_urinary"))
+
+if (nrow(smoking_all_data) > 0) {
+  tab <- smoking_all_data |>
+    mutate(
+      use_sci = pmax(abs(odds_ratio), abs(ci_lower), abs(ci_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      or_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", odds_ratio, ci_lower, ci_upper),
+        sprintf("%.2f (%.2f-%.2f)", odds_ratio, ci_lower, ci_upper)),
+      Organ_Display = case_when(
+        predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+        TRUE ~ predictor
+      )
+    ) |>
+    select(Organ = Organ_Display, `OR (95% CI)` = or_formatted, FDR)
+  
+  write.csv(tab, file = file.path(csv_dir_focused, "smoking_all_pairs_focused.csv"), row.names = FALSE)
+}
+
+# Save CSV for focused smoking - MZ pairs
+smoking_mz_data <- smoking_discordant_mz |>
+  filter(is.na(error_message), predictor %in% c("Lung", "Gastrointestinal_tract", "Kidney_urinary"))
+
+if (nrow(smoking_mz_data) > 0) {
+  tab <- smoking_mz_data |>
+    mutate(
+      use_sci = pmax(abs(odds_ratio), abs(ci_lower), abs(ci_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      or_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", odds_ratio, ci_lower, ci_upper),
+        sprintf("%.2f (%.2f-%.2f)", odds_ratio, ci_lower, ci_upper)),
+      Organ_Display = case_when(
+        predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+        TRUE ~ predictor
+      )
+    ) |>
+    select(Organ = Organ_Display, `OR (95% CI)` = or_formatted, FDR)
+  
+  write.csv(tab, file = file.path(csv_dir_focused, "smoking_mz_pairs_focused.csv"), row.names = FALSE)
+}
+```
+
+# Prevalent Disease Analysis
+
+**Analysis Goal:**
+Examine whether organ ages are associated with disease presence at baseline using logistic regression. Unlike Cox analyses that exclude prevalent cases, this analysis specifically focuses on prevalent disease (disease present at baseline).
+
+**Model:** `prevalent_disease ~ organ_age + selected_covariates`  
+**Method:** Logistic regression with cluster-robust standard errors  
+**Multiple testing:** FDR correction applied within each disease
+
+## Disease Configuration
+
+```{r prevalent_disease_config}
+diseases_config <- list(
+  diabetes = list(var = "diabetes", date = "diabetes_date", name = "Diabetes"),
+  dementia = list(var = "dementia", date = "dementia_date", name = "Dementia"),
+  parkinsons = list(var = "parkinson_and_parkinsonism", date = "parkinson_and_parkinsonism_date", name = "Parkinson"),
+  ischemic_heart_disease = list(var = "ischemic_heart_disease", date = "ischemic_heart_disease_date", name = "Ischemic heart disease"),
+  atrial_fibrillation = list(var = "atrial_fibrillation", date = "atrial_fibrillation_date", name = "Atrial fibrillation"),
+  cerebrovascular_disease = list(var = "cerebrovascular_disease", date = "cerebrovascular_disease_date", name = "Cerebrovascular disease"),
+  heart_failure = list(var = "heart_failure", date = "heart_failure_date", name = "Heart failure"),
+  melanoma = list(var = "Melanoma", date = "Melanoma_date", name = "Melanoma"),
+  prostate_cancer = list(var = "Prostate cancer", date = "Prostate cancer_date", name = "Prostate cancer"),
+  multiple_myeloma = list(var = "Multiple myeloma", date = "Multiple myeloma_date", name = "Multiple myeloma"),
+  brain_cancer = list(var = "Brain cancer", date = "Brain cancer_date", name = "Brain cancer"),
+  lung_cancer = list(var = "Lung cancer", date = "Lung cancer_date", name = "Lung cancer"),
+  breast_cancer = list(var = "Breast cancer", date = "Breast cancer_date", name = "Breast cancer"),
+  colorectal_cancer = list(var = "Colorectal cancer", date = "Colorectal cancer_date", name = "Colorectal cancer"),
+  kidney_cancer = list(var = "Kidney cancer", date = "Kidney cancer_date", name = "Kidney cancer"),
+  bladder_cancer = list(var = "Bladder cancer", date = "Bladder cancer_date", name = "Bladder cancer"),
+  esophageal_cancer = list(var = "Esophageal cancer", date = "Esophageal cancer_date", name = "Esophageal cancer"),
+  stomach_cancer = list(var = "Stomach cancer", date = "Stomach cancer_date", name = "Stomach cancer"),
+  liver_cancer = list(var = "Liver cancer", date = "Liver cancer_date", name = "Liver cancer"),
+  lymphoma = list(var = "Lymphoma", date = "Lymphoma_date", name = "Lymphoma")
+)
+
+min_prevalent_cases <- ceiling(nrow(twins_analysis) * 0.01)
+
+disease_prevalent_counts <- map_dfr(names(diseases_config), function(d) {
+  spec <- diseases_config[[d]]
+  prevalent_cases <- twins_analysis |>
+    filter(!!sym(spec$var) == 1, !is.na(!!sym(spec$date)), !!sym(spec$date) <= checkdate) |>
+    nrow()
+  tibble(disease = d, prevalent_cases = prevalent_cases, eligible = prevalent_cases >= min_prevalent_cases)
+})
+
+eligible_diseases <- disease_prevalent_counts |> filter(eligible) |> pull(disease)
+diseases <- diseases_config[names(diseases_config) %in% eligible_diseases]
+```
+
+## Analysis Functions
+
+```{r prevalent_analysis_functions}
+create_prevalent_disease_data <- function(disease_var, disease_date_var, disease_name) {
+  twins_analysis |>
+    filter(
+      (!!sym(disease_var) == 0 | is.na(!!sym(disease_var))) |
+      (!!sym(disease_var) == 1 & !is.na(!!sym(disease_date_var)) & !!sym(disease_date_var) <= checkdate)
+    ) |>
+    mutate(
+      prevalent_disease = case_when(
+        !!sym(disease_var) == 1 & !is.na(!!sym(disease_date_var)) & !!sym(disease_date_var) <= checkdate ~ 1,
+        TRUE ~ 0
+      )
+    )
+}
+
+analyze_prevalent_disease_univariate <- function(prevalent_data, disease_name, predictor_df, predictor_name) {
+  map_dfr(names(predictor_df)[-1], function(pred) {
+    analysis_data <- prevalent_data |>
+      left_join(predictor_df |> select(twin_id, all_of(pred)), by = "twin_id") |>
+      filter(!is.na(!!sym(pred)), !is.na(prevalent_disease))
+    
+    # Filter by sex for sex-specific diseases
+    if (grepl("prostate", disease_name, ignore.case = TRUE)) {
+      analysis_data <- analysis_data |> filter(sex == 1)  # Males only
+    } else if (grepl("breast|ovarian", disease_name, ignore.case = TRUE)) {
+      analysis_data <- analysis_data |> filter(sex == 2)  # Females only
+    }
+    
+    if (nrow(analysis_data) < 10) {
+      return(tibble(
+        disease = disease_name, predictor = pred, estimate = NA_real_, std_error = NA_real_,
+        z_value = NA_real_, p_value = NA_real_, odds_ratio = NA_real_, ci_lower = NA_real_,
+        ci_upper = NA_real_, model = predictor_name, analysis_type = "univariate"
+      ))
+    }
+    
+    covariates <- get_covariates("prevalent_disease")
+    # Remove sex from covariates for sex-specific diseases since there's no variation
+    if (grepl("prostate|breast|ovarian", disease_name, ignore.case = TRUE)) {
+      covariates <- setdiff(covariates, "sex")
+    }
+    formula <- as.formula(paste("prevalent_disease ~", pred, 
+                               if(length(covariates) > 0) paste("+", paste(covariates, collapse = " + ")) else ""))
+    
+    tryCatch({
+      model <- glm(formula, data = analysis_data, family = binomial)
+      cluster_se <- vcovCL(model, cluster = ~pair_id)
+      coeftest_model <- coeftest(model, vcov = cluster_se)
+      estimate <- coeftest_model[pred, "Estimate"]
+      std_error <- coeftest_model[pred, "Std. Error"]
+      
+      tibble(
+        disease = disease_name, predictor = pred, estimate = estimate, std_error = std_error,
+        z_value = coeftest_model[pred, "z value"], p_value = coeftest_model[pred, "Pr(>|z|)"],
+        odds_ratio = exp(estimate), ci_lower = exp(estimate - 1.96 * std_error),
+        ci_upper = exp(estimate + 1.96 * std_error), model = predictor_name, analysis_type = "univariate"
+      )
+    }, error = function(e) {
+      tibble(
+        disease = disease_name, predictor = pred, estimate = NA_real_, std_error = NA_real_,
+        z_value = NA_real_, p_value = NA_real_, odds_ratio = NA_real_, ci_lower = NA_real_,
+        ci_upper = NA_real_, model = predictor_name, analysis_type = "univariate"
+      )
+    })
+  })
+}
+```
+
+## Forest Tables
+
+```{r prevalent_forest_helpers}
+create_prevalent_forest_table <- function(data, disease_name, analysis_type = "univariate", 
+                                         model_type = "mortality", title = NULL, main_color = "black",
+                                         time_window = NULL) {
+  expected_model <- if(analysis_type == "univariate") model_type else paste0(model_type, "_multivariate")
+  
+  forest_data <- data |> filter(disease == disease_name, analysis_type == analysis_type, model == expected_model)
+  if (nrow(forest_data) == 0) return(NULL)
+  
+  disease_config <- diseases[[disease_name]]
+  if (is.null(disease_config)) {
+    display_name <- disease_name
+    disease_cases <- NA
+    sample_size <- NA
+  } else {
+    display_name <- disease_config$name
+    disease_var <- disease_config$var
+    
+    # Determine if sex filtering is needed
+    sex_filter <- if (grepl("prostate", display_name, ignore.case = TRUE)) {
+      1  # Males only
+    } else if (grepl("breast|ovarian", display_name, ignore.case = TRUE)) {
+      2  # Females only
+    } else {
+      NULL  # No sex filter
+    }
+    
+    # Debug output
+    if (!is.null(sex_filter)) {
+      cat("Disease:", display_name, "| Sex filter:", sex_filter, "\n")
+    }
+    
+    # Calculate cases based on time window
+    if (!is.null(time_window)) {
+      delta <- as.difftime(round(time_window * 365.25), units = "days")
+      
+      # Apply sex filter if needed
+      data_filtered <- twins_analysis
+      if (!is.null(sex_filter)) {
+        data_filtered <- data_filtered |> filter(sex == sex_filter)
+      }
+      
+      disease_cases <- data_filtered |> 
+        filter(
+          !!sym(disease_var) == 1, !is.na(!!sym(disease_config$date)),
+          !!sym(disease_config$date) <= checkdate,
+          !!sym(disease_config$date) >= checkdate - delta
+        ) |> 
+        nrow()
+      
+      sample_size <- data_filtered |> 
+        filter(
+          (!!sym(disease_var) == 0 | is.na(!!sym(disease_var))) |
+          (!!sym(disease_var) == 1 & !is.na(!!sym(disease_config$date)) & 
+           !!sym(disease_config$date) <= checkdate & 
+           !!sym(disease_config$date) >= checkdate - delta)
+        ) |> 
+        nrow()
+    } else {
+      # All prevalent cases (no time window)
+      # Apply sex filter if needed
+      data_filtered <- twins_analysis
+      if (!is.null(sex_filter)) {
+        data_filtered <- data_filtered |> filter(sex == sex_filter)
+      }
+      
+      disease_cases <- data_filtered |> 
+        filter(!!sym(disease_var) == 1, !is.na(!!sym(disease_config$date)), !!sym(disease_config$date) <= checkdate) |> 
+        nrow()
+      
+      sample_size <- data_filtered |> 
+        filter((!!sym(disease_var) == 0 | is.na(!!sym(disease_var))) |
+               (!!sym(disease_var) == 1 & !is.na(!!sym(disease_config$date)) & !!sym(disease_config$date) <= checkdate)) |> 
+        nrow()
+    }
+  }
+  
+  if (is.null(title)) {
+    title <- paste(display_name, "(cases =", disease_cases, ", n =", sample_size, ")")
+  }
+  
+  forest_data <- forest_data |>
+    mutate(
+      or = odds_ratio, or_lower = ci_lower, or_upper = ci_upper, fdr = FDR, significant = FDR < 0.05,
+      errorbar_color = if_else(FDR < 0.05, "grey30", "gray80"),
+      Organ_Display = case_when(
+        predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        predictor == "Kidney_urinary" ~ "Kidney and Bladder", TRUE ~ str_to_title(predictor)
+      )
+    ) |>
+    arrange(desc(odds_ratio)) |>
+    mutate(y_pos = rev(seq_along(predictor)), Organ_Display = factor(Organ_Display, levels = Organ_Display))
+  
+  # Dynamic x-axis limits with hard caps
+  base_min <- 0.25
+  base_max <- 3
+  hard_min <- 0.05
+  hard_max <- 10
+  
+  x_min <- suppressWarnings(min(forest_data$or_lower, na.rm = TRUE))
+  x_max <- suppressWarnings(max(forest_data$or_upper, na.rm = TRUE))
+  
+  if (!is.finite(x_min)) x_min <- base_min
+  if (!is.finite(x_max)) x_max <- base_max
+  
+  x_min <- max(x_min, 0.001)
+  
+  lower_margin_factor <- 0.9
+  upper_margin_factor <- 1.1
+  
+  x_min <- min(base_min, x_min * lower_margin_factor)
+  x_max <- max(base_max, x_max * upper_margin_factor)
+  
+  x_min <- max(hard_min, x_min)
+  x_max <- min(hard_max, x_max)
+  
+  x_breaks <- pretty(c(x_min, x_max), n = 6)
+  x_breaks <- x_breaks[x_breaks >= x_min & x_breaks <= x_max]
+  
+  # Add formatted OR column and detect if scientific notation is needed
+  forest_data <- forest_data |>
+    mutate(
+      use_sci = pmax(abs(or), abs(or_lower), abs(or_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      or_formatted = if_else(
+        use_sci,
+        sprintf("%.1e (%.1e-%.1e)", or, or_lower, or_upper),
+        sprintf("%.2f (%.2f-%.2f)", or, or_lower, or_upper)
+      )
+    )
+  
+  # Detect if we need wider table for scientific notation
+  has_sci_notation <- any(forest_data$use_sci, na.rm = TRUE)
+  table_width_ratio <- if (has_sci_notation) 3.2 else 2.5
+  
+  tab <- forest_data |>
+    transmute(
+      y_pos, `Organ age` = Organ_Display,
+      `OR (95% CI)` = or_formatted,
+      FDR = sprintf("%.2e", fdr)
+    )
+  
+  x_pos <- tibble(col = c("Organ age", "OR (95% CI)", "FDR"), x = c(1.0, 4.0, 7.5))
+  table_long <- tab |> pivot_longer(-y_pos, names_to = "col", values_to = "val") |> left_join(x_pos, by = "col")
+  
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3) +
+    geom_text(data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), 
+             aes(x = x, y = y_pos, label = col), hjust = c(0, 0, 1), fontface = "bold", 
+             inherit.aes = FALSE, size = 3.3) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 9.0), expand = c(0, 0)) +
+    labs(title = title) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(hjust = 0.1, size = 12), axis.title = element_blank(),
+         axis.text.x = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank(),
+         plot.margin = unit(c(12, 6, 6, 6), "pt"))
+  
+  # Determine which points are out of bounds and cap CIs to plot range
+  forest_data <- forest_data |>
+    mutate(
+      out_of_bounds_point = or < x_min | or > x_max,
+      or_lower_capped = pmax(or_lower, x_min),
+      or_upper_capped = pmin(or_upper, x_max),
+      has_any_value_outside = (or < x_min | or > x_max | or_lower < x_min | or_upper > x_max)
+    )
+  
+  # Only plot data where the OR itself is within bounds
+  data_in_bounds <- forest_data |> filter(!out_of_bounds_point)
+  
+  # Calculate legend positions
+  legend_y <- max(forest_data$y_pos) + 1.5
+  legend_left_x <- x_min + (x_max - x_min) * 0.03
+  legend_right_x <- x_min + (x_max - x_min) * 0.60
+  legend_bottom_y <- 0.25
+  legend_bottom_x <- x_min + (x_max - x_min) * 0.60
+  
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, 
+                 fill = factor(seq_along(predictor) %% 2)), alpha = 0.6, show.legend = FALSE) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(aes(x = 1, xend = 1, y = 0.5, yend = max(forest_data$y_pos) + 0.75), 
+                linetype = "33", color = "grey10", size = 0.7) +
+    {if (nrow(data_in_bounds) > 0) geom_errorbarh(data = data_in_bounds, aes(xmin = or_lower_capped, xmax = or_upper_capped, y = y_pos), color = data_in_bounds$errorbar_color, height = 0.15, size = 0.6, inherit.aes = FALSE)} +
+    {if (nrow(data_in_bounds) > 0) geom_point(data = data_in_bounds, aes(x = or, color = significant), size = 2.5, shape = 16)} +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) geom_text(data = data_in_bounds |> filter(has_any_value_outside), aes(x = or, y = y_pos + 0.25), label = "*", size = 3.5, color = "black")} +
+    annotate("text", x = legend_left_x, y = legend_y, 
+            label = "● Significant (FDR < 0.05)", hjust = 0, size = 2.6, color = main_color) +
+    annotate("text", x = legend_right_x, y = legend_y, 
+            label = "● Non-significant", hjust = 0, size = 2.6, color = "gray80") +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) annotate("text", x = legend_bottom_x, y = legend_bottom_y, label = "* Value outside plot range", hjust = 1, size = 2.4, color = "black")} +
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(
+      limits = c(x_min, x_max),
+      breaks = x_breaks,
+      labels = format(x_breaks, digits = 3, trim = TRUE)
+    ) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Odds Ratio (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.y = element_blank(), axis.text.x = element_text(size = 9),
+         axis.title.x = element_text(size = 10), panel.grid = element_blank(),
+         plot.margin = unit(c(12, 12, 6, 0), "pt"), legend.position = "none") +
+    coord_cartesian(clip = "off")
+  
+  p_table + p_forest + plot_layout(widths = c(table_width_ratio, 2))
+}
+
+```
+
+## Sensitivity Analysis: Time Windows
+
+```{r prevalent_sensitivity_setup}
+prevalent_time_windows <- c(5, 10)
+
+build_prevalent_time_window <- function(disease_var, disease_date_var, years_back) {
+  delta <- as.difftime(round(years_back * 365.25), units = "days")
+  twins_analysis |>
+    filter(
+      (!!sym(disease_var) == 0 | is.na(!!sym(disease_var))) |
+      (!!sym(disease_var) == 1 & !is.na(!!sym(disease_date_var)) & 
+       !!sym(disease_date_var) <= checkdate & 
+       !!sym(disease_date_var) >= checkdate - delta)
+    ) |>
+    mutate(
+      prevalent_disease = case_when(
+        !!sym(disease_var) == 1 & !is.na(!!sym(disease_date_var)) & 
+        !!sym(disease_date_var) <= checkdate & 
+        !!sym(disease_date_var) >= checkdate - delta ~ 1,
+        TRUE ~ 0
+      )
+    )
+}
+```
+
+```{r prevalent_sensitivity_analyses}
+sensitivity_results <- map(prevalent_time_windows, function(tw) {
+  cat("\n=== Analyzing", tw, "year time window ===\n")
+  
+  # Check eligible diseases for this window
+  elig_diseases <- map_dfr(names(diseases_config), function(d) {
+    sp <- diseases_config[[d]]
+    delta <- as.difftime(round(tw * 365.25), units = "days")
+    n_prev <- twins_analysis |>
+      filter(
+        !!sym(sp$var) == 1, !is.na(!!sym(sp$date)),
+        !!sym(sp$date) <= checkdate,
+        !!sym(sp$date) >= checkdate - delta
+      ) |>
+      nrow()
+    tibble(disease = d, n_cases = n_prev, eligible = n_prev >= min_prevalent_cases)
+  }) |>
+    filter(eligible) |>
+    pull(disease)
+  
+  if (length(elig_diseases) == 0) {
+    cat("No eligible diseases for", tw, "year window\n")
+    return(NULL)
+  }
+  
+  cat("Eligible diseases:", length(elig_diseases), "\n")
+  
+  # Run analyses for eligible diseases
+  results <- map(elig_diseases, function(disease_name) {
+    sp <- diseases_config[[disease_name]]
+    prev_data <- build_prevalent_time_window(sp$var, sp$date, tw)
+    analyze_prevalent_disease_univariate(prev_data, sp$name, organ_age_mortality, "mortality")
+  }) |> set_names(elig_diseases)
+  
+  # Combine and add FDR
+  all_results <- bind_rows(results, .id = "disease_key") |>
+    mutate(
+      model_type = "logistic",
+      outcome_type = "prevalent_disease",
+      disease = disease_key,
+      time_window = tw
+    ) |>
+    group_by(disease, analysis_type, model) |>
+    mutate(FDR = p.adjust(p_value, method = "fdr")) |>
+    ungroup()
+  
+  return(all_results)
+}) |> set_names(paste0(prevalent_time_windows, "y"))
+
+sensitivity_results <- compact(sensitivity_results)
+```
+
+```{r create_prevalent_heatmap_function}
+create_prevalent_heatmap <- function(data, group_name) {
+  group_data <- data |> filter(outcome_group %in% group_name)
+  if (nrow(group_data) == 0) return(NULL)
+  
+  all_organs <- unique(group_data$predictor) |> na.omit()
+  organ_order <- c(intersect(fixed_organ_order, all_organs), setdiff(all_organs, fixed_organ_order))
+  
+  group_matrix <- group_data |>
+    select(outcome, predictor, effect_size) |>
+    pivot_wider(names_from = predictor, values_from = effect_size, values_fill = 0) |>
+    column_to_rownames("outcome") |>
+    as.matrix()
+  
+  outcome_order <- if (nrow(group_matrix) > 1) {
+    rownames(group_matrix)[hclust(dist(group_matrix), method = "ward.D2")$order]
+  } else {
+    rownames(group_matrix)
+  }
+  
+  predictor_order <- intersect(organ_order, colnames(group_matrix))
+  
+  if (length(outcome_order) == 0 || length(predictor_order) == 0) return(NULL)
+  
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  group_data_plot <- group_data |>
+    mutate(
+      outcome = factor(outcome, levels = outcome_order),
+      predictor = factor(predictor, levels = predictor_order),
+      outcome_num = (as.numeric(outcome) - 1) * square_size + square_size/2,
+      predictor_num = (as.numeric(predictor) - 1) * square_size + square_size/2,
+      effect_size_colored = if_else(impossible, NA_real_, if_else(significance != "", effect_size, NA_real_)),
+      non_sig_marker = if_else(impossible, "", if_else(significance == "", "×", ""))
+    )
+  
+  # Calculate dynamic limits (white-to-red only, no negative values)
+  effect_range <- range(group_data$effect_size, na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  ggplot(group_data_plot, aes(x = predictor_num, y = outcome_num, fill = effect_size_colored)) +
+    geom_tile(width = square_size, height = square_size, color = NA) +
+    geom_text(aes(x = predictor_num, y = outcome_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(0, max_limit * 0.5, max_limit)),
+      limits = c(0, max_limit),
+      na.value = "white",
+      name = "log(Odds\nRatio)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    scale_x_continuous(
+      breaks = (seq_along(predictor_order) - 1) * square_size + square_size/2,
+      labels = predictor_order,
+      expand = c(0, 0),
+      limits = c(0, length(predictor_order) * square_size)
+    ) +
+    scale_y_continuous(
+      breaks = (seq_along(outcome_order) - 1) * square_size + square_size/2,
+      labels = outcome_order,
+      expand = c(0, 0),
+      limits = c(0, length(outcome_order) * square_size)
+    ) +
+    theme_minimal(base_family = "Helvetica") +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      legend.position = "right",
+      legend.title = element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = unit(0.8, "cm"),
+      legend.key.width = unit(0.5, "cm"),
+      panel.grid = element_blank(),
+      panel.spacing = unit(0, "lines"),
+      panel.border = element_blank(),
+      plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    coord_fixed(ratio = 1, expand = FALSE)
+}
+```
+
+```{r prevalent_sensitivity_heatmaps}
+sensitivity_heatmaps <- map(names(sensitivity_results), function(window_name) {
+  tw <- as.numeric(gsub("y", "", window_name))
+  results <- sensitivity_results[[window_name]]
+  
+  # Prepare heatmap data
+  heatmap_data <- results |>
+    filter(analysis_type == "univariate", model == "mortality") |>
+    mutate(
+      outcome_raw = disease,
+      outcome = case_when(
+        disease == "Diabetes" ~ "Diabetes",
+        disease == "Dementia" ~ "Dementia",
+        disease == "Parkinson" ~ "Parkinson",
+        disease == "Ischemic heart disease" ~ "Ischemic Heart Disease",
+        disease == "Atrial fibrillation" ~ "Atrial Fibrillation",
+        disease == "Cerebrovascular disease" ~ "Cerebrovascular Disease",
+        disease == "Heart failure" ~ "Heart Failure",
+        TRUE ~ str_to_title(str_replace_all(disease, "_", " "))
+      ),
+      predictor = case_when(
+        predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+        predictor == "Artery" ~ "Arterial",
+        predictor == "Immune" ~ "Immune",
+        predictor == "Vessel" ~ "Vessel",
+        TRUE ~ str_to_title(predictor)
+      ),
+      effect_size = log(odds_ratio),
+      impossible = case_when(
+        outcome %in% c("Breast Cancer", "Ovarian Cancer") & predictor == "Prostate" ~ TRUE,
+        outcome == "Prostate Cancer" & predictor == "Ovary" ~ TRUE,
+        TRUE ~ FALSE
+      ),
+      significance = case_when(
+        impossible ~ "",
+        FDR < 0.001 ~ "***",
+        FDR < 0.01 ~ "**",
+        FDR < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      outcome_group = if_else(str_detect(outcome, "cancer|Cancer"), "Cancer", "Non-Cancer Diseases"),
+      model_type = "logistic"
+    ) |>
+    select(outcome, predictor, effect_size, significance, outcome_group, model_type, impossible) |>
+    clean_names()
+  
+  # Create heatmap
+  heatmap <- create_prevalent_heatmap(heatmap_data, c("Non-Cancer Diseases", "Cancer"))
+  
+  # Save heatmap
+  if (!is.null(heatmap)) {
+    filepath <- file.path(prevalent_disease_base, "main", paste0(tw, "y"), 
+                         "mortality_organ_age_heatmap_combined.svg")
+    save_plot(filepath, heatmap, width = 12, height = 8, dpi = 300)
+    cat("Saved heatmap for", tw, "year window\n")
+  }
+  
+  return(heatmap)
+}) |> set_names(names(sensitivity_results))
+```
+
+```{r prevalent_sensitivity_forest_tables}
+sensitivity_forest_tables <- map(names(sensitivity_results), function(window_name) {
+  tw <- as.numeric(gsub("y", "", window_name))
+  results <- sensitivity_results[[window_name]]
+  
+  # Get unique diseases in this window
+  diseases_in_window <- unique(results$disease)
+  
+  # Create forest tables for each disease
+  forest_plots <- map(diseases_in_window, function(disease_name) {
+    disease_data <- results |> 
+      filter(disease == disease_name, analysis_type == "univariate", model == "mortality")
+    
+    if (nrow(disease_data) == 0) return(NULL)
+    
+    create_prevalent_forest_table(
+      data = results,
+      disease_name = disease_name,
+      analysis_type = "univariate",
+      model_type = "mortality",
+      time_window = tw
+    )
+  }) |> set_names(diseases_in_window)
+  
+  forest_plots <- compact(forest_plots)
+  
+  # Save forest tables
+  for (disease_name in names(forest_plots)) {
+    disease_config <- diseases_config[[disease_name]]
+    display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+    
+    filename <- paste0("prevalent_forest_", tolower(str_replace_all(display_name, " ", "_")), ".svg")
+    filepath <- file.path(prevalent_disease_base, "main", paste0(tw, "y"), filename)
+    
+    save_plot(filepath, forest_plots[[disease_name]], width = 10, height = 5, dpi = 300)
+  }
+  
+  # Create CSV tables directory for this time window
+  csv_dir_prevalent <- file.path(prevalent_disease_base, "main", paste0(tw, "y"), "tables")
+  dir.create(csv_dir_prevalent, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save table data as CSV for prevalent disease
+  for (disease_name in names(forest_plots)) {
+    disease_data <- results |> 
+      filter(disease == disease_name, analysis_type == "univariate", model == "mortality")
+    
+    if (nrow(disease_data) == 0) next
+    
+    tab <- disease_data |>
+      mutate(
+        use_sci = pmax(abs(odds_ratio), abs(ci_lower), abs(ci_upper), na.rm = TRUE) >= 10,
+        or_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", odds_ratio, ci_lower, ci_upper),
+          sprintf("%.2f (%.2f-%.2f)", odds_ratio, ci_lower, ci_upper)),
+        Organ_Display = case_when(
+          predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+          predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+          TRUE ~ str_to_title(predictor)
+        )
+      ) |>
+      select(Organ = Organ_Display, `OR (95% CI)` = or_formatted, FDR)
+    
+    disease_config <- diseases_config[[disease_name]]
+    display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+    filename <- paste0("prevalent_", tolower(str_replace_all(display_name, " ", "_")), ".csv")
+    write.csv(tab, file = file.path(csv_dir_prevalent, filename), row.names = FALSE)
+  }
+  
+  cat("Saved", length(forest_plots), "forest tables for", tw, "year window\n")
+  
+  return(forest_plots)
+}) |> set_names(names(sensitivity_results))
+
+cat("\n=== Sensitivity Analysis Summary ===\n")
+cat("Time windows analyzed:", paste(prevalent_time_windows, "years"), "\n")
+cat("Total heatmaps saved:", length(compact(sensitivity_heatmaps)), "\n")
+cat("Total forest tables saved:", sum(map_int(sensitivity_forest_tables, length)), "\n")
+```
+
+## Within-Pair Analyses: Discordant Twins
+
+```{r prevalent_discordant_setup}
+min_discordant_pairs <- nrow(twins_analysis)*0.005
+
+check_discordant_pairs <- function(prevalent_data, disease_name, mz_only = FALSE) {
+  n_pairs <- prevalent_data |>
+    group_by(pair_id) |>
+    filter(
+      n() == 2,
+      if (mz_only) all(bestzyg == 1) else TRUE,
+      sum(prevalent_disease == 1, na.rm = TRUE) == 1
+    ) |>
+    ungroup() |>
+    summarise(n_pairs = n_distinct(pair_id)) |>
+    pull(n_pairs)
+  
+  return(n_pairs)
+}
+
+run_prevalent_discordant <- function(prevalent_data, predictor_df, disease_name, mz_only = FALSE) {
+  predictors <- setdiff(colnames(predictor_df), "twin_id")
+  
+  discordant_twins <- prevalent_data |>
+    group_by(pair_id) |>
+    filter(
+      n() == 2,
+      if (mz_only) all(bestzyg == 1) else TRUE,
+      sum(prevalent_disease == 1, na.rm = TRUE) == 1
+    ) |>
+    ungroup()
+  
+  # Apply sex filtering for sex-specific diseases
+  if (grepl("prostate", disease_name, ignore.case = TRUE)) {
+    discordant_twins <- discordant_twins |> filter(sex == 1)
+  } else if (grepl("breast|ovarian", disease_name, ignore.case = TRUE)) {
+    discordant_twins <- discordant_twins |> filter(sex == 2)
+  }
+  
+  map_dfr(predictors, function(pred) {
+    df <- discordant_twins |>
+      left_join(predictor_df |> select(twin_id, all_of(pred)), by = "twin_id") |>
+      filter(!is.na(.data[[pred]]))
+    
+    if (pred %in% c("Ovary", "Prostate")) {
+      df <- df |> filter(sex == if (pred == "Ovary") 2 else 1)
+    }
+    
+    if (n_distinct(df$pair_id) < 3) {
+      return(tibble(
+        disease = disease_name, predictor = pred, estimate = NA_real_, std_error = NA_real_,
+        p_value = NA_real_, odds_ratio = NA_real_, ci_lower = NA_real_, ci_upper = NA_real_,
+        n_pairs = NA_integer_, model = "mortality", analysis_type = "within_pair"
+      ))
+    }
+    
+    tryCatch({
+      fit <- clogit(as.formula(paste0("prevalent_disease ~ scale(`", pred, "`) + strata(pair_id)")), data = df)
+      est <- as.numeric(coef(fit)[1])
+      se <- sqrt(diag(vcov(fit)))[1]
+      p <- summary(fit)$coefficients[1, "Pr(>|z|)"]
+      
+      tibble(
+        disease = disease_name,
+        predictor = pred,
+        estimate = est,
+        std_error = se,
+        p_value = as.numeric(p),
+        odds_ratio = exp(est),
+        ci_lower = exp(est - 1.96 * se),
+        ci_upper = exp(est + 1.96 * se),
+        n_pairs = n_distinct(df$pair_id),
+        model = "mortality",
+        analysis_type = "within_pair"
+      )
+    }, error = function(e) {
+      tibble(
+        disease = disease_name, predictor = pred, estimate = NA_real_, std_error = NA_real_,
+        p_value = NA_real_, odds_ratio = NA_real_, ci_lower = NA_real_, ci_upper = NA_real_,
+        n_pairs = NA_integer_, model = "mortality", analysis_type = "within_pair"
+      )
+    })
+  }) |>
+    mutate(FDR = p.adjust(p_value, method = "fdr"))
+}
+```
+
+```{r prevalent_discordant_time_windows}
+cat("\n=== Checking Discordant Pairs: Time Windows ===\n")
+
+time_window_discordant <- map(prevalent_time_windows, function(tw) {
+  cat("\n--- Time window:", tw, "years ---\n")
+  
+  # Check eligibility for all pairs
+  eligible_all <- map_dfr(names(diseases_config), function(disease_name) {
+    spec <- diseases_config[[disease_name]]
+    prev_data <- build_prevalent_time_window(spec$var, spec$date, tw)
+    n_pairs <- check_discordant_pairs(prev_data, spec$name, mz_only = FALSE)
+    tibble(disease = disease_name, n_pairs = n_pairs, eligible = n_pairs >= min_discordant_pairs)
+  }) |> filter(eligible) |> pull(disease)
+  
+  # Check eligibility for MZ pairs
+  eligible_mz <- map_dfr(names(diseases_config), function(disease_name) {
+    spec <- diseases_config[[disease_name]]
+    prev_data <- build_prevalent_time_window(spec$var, spec$date, tw)
+    n_pairs <- check_discordant_pairs(prev_data, spec$name, mz_only = TRUE)
+    tibble(disease = disease_name, n_pairs = n_pairs, eligible = n_pairs >= min_discordant_pairs)
+  }) |> filter(eligible) |> pull(disease)
+  
+  cat("Eligible (all pairs):", length(eligible_all), "| Eligible (MZ pairs):", length(eligible_mz), "\n")
+  
+  results <- list()
+  
+  # All pairs
+  if (length(eligible_all) > 0) {
+    results$all <- map(eligible_all, function(disease_name) {
+      spec <- diseases_config[[disease_name]]
+      prev_data <- build_prevalent_time_window(spec$var, spec$date, tw)
+      run_prevalent_discordant(prev_data, organ_age_mortality, spec$name, mz_only = FALSE)
+    }) |> set_names(eligible_all) |>
+      bind_rows(.id = "disease_key") |>
+      mutate(model_type = "conditional_logistic", outcome_type = "prevalent_disease", 
+             pair_type = "all", time_window = tw)
+  }
+  
+  # MZ pairs
+  if (length(eligible_mz) > 0) {
+    results$mz <- map(eligible_mz, function(disease_name) {
+      spec <- diseases_config[[disease_name]]
+      prev_data <- build_prevalent_time_window(spec$var, spec$date, tw)
+      run_prevalent_discordant(prev_data, organ_age_mortality, spec$name, mz_only = TRUE)
+    }) |> set_names(eligible_mz) |>
+      bind_rows(.id = "disease_key") |>
+      mutate(model_type = "conditional_logistic", outcome_type = "prevalent_disease", 
+             pair_type = "mz", time_window = tw)
+  }
+  
+  return(results)
+}) |> set_names(paste0(prevalent_time_windows, "y"))
+```
+
+```{r create_discordant_heatmaps}
+create_discordant_heatmap_data <- function(results_data) {
+  results_data |>
+    mutate(
+      outcome = case_when(
+        disease == "Diabetes" ~ "Diabetes",
+        disease == "Dementia" ~ "Dementia",
+        disease == "Parkinson" ~ "Parkinson",
+        disease == "Ischemic heart disease" ~ "Ischemic Heart Disease",
+        disease == "Atrial fibrillation" ~ "Atrial Fibrillation",
+        disease == "Cerebrovascular disease" ~ "Cerebrovascular Disease",
+        disease == "Heart failure" ~ "Heart Failure",
+        TRUE ~ str_to_title(str_replace_all(disease, "_", " "))
+      ),
+      predictor = case_when(
+        predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+        predictor == "Artery" ~ "Arterial",
+        predictor == "Immune" ~ "Immune",
+        predictor == "Vessel" ~ "Vessel",
+        TRUE ~ str_to_title(predictor)
+      ),
+      effect_size = log(odds_ratio),
+      impossible = case_when(
+        outcome %in% c("Breast Cancer", "Ovarian Cancer") & predictor == "Prostate" ~ TRUE,
+        outcome == "Prostate Cancer" & predictor == "Ovary" ~ TRUE,
+        TRUE ~ FALSE
+      ),
+      significance = case_when(
+        impossible ~ "",
+        FDR < 0.001 ~ "***",
+        FDR < 0.01 ~ "**",
+        FDR < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      outcome_group = if_else(str_detect(outcome, "cancer|Cancer"), "Cancer", "Non-Cancer Diseases"),
+      model_type = "conditional_logistic"
+    ) |>
+    select(outcome, predictor, effect_size, significance, outcome_group, model_type, impossible) |>
+    clean_names()
+}
+
+# Create and save heatmaps for time windows
+for (window_name in names(time_window_discordant)) {
+  tw_data <- time_window_discordant[[window_name]]
+  
+  if (!is.null(tw_data$all) && nrow(tw_data$all) > 0) {
+    heatmap_data <- create_discordant_heatmap_data(tw_data$all)
+    heatmap <- create_prevalent_heatmap(heatmap_data, c("Non-Cancer Diseases", "Cancer"))
+    if (!is.null(heatmap)) {
+      filepath <- file.path(prevalent_disease_base, "within", window_name, "all_pairs_heatmap.svg")
+      save_plot(filepath, heatmap, width = 12, height = 8, dpi = 300)
+    }
+  }
+  
+  if (!is.null(tw_data$mz) && nrow(tw_data$mz) > 0) {
+    heatmap_data <- create_discordant_heatmap_data(tw_data$mz)
+    heatmap <- create_prevalent_heatmap(heatmap_data, c("Non-Cancer Diseases", "Cancer"))
+    if (!is.null(heatmap)) {
+      filepath <- file.path(prevalent_disease_base, "within", window_name, "mz_pairs_heatmap.svg")
+      save_plot(filepath, heatmap, width = 12, height = 8, dpi = 300)
+    }
+  }
+}
+```
+
+```{r create_discordant_forest_function}
+create_discordant_forest <- function(data, disease_name, n_pairs, pair_type_label) {
+  forest_data <- data |> filter(disease == disease_name)
+  if (nrow(forest_data) == 0) return(NULL)
+  
+  disease_config <- diseases_config[[disease_name]]
+  display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+  title <- paste0(display_name, " - ", pair_type_label, " (", n_pairs, " discordant pairs)")
+  
+  forest_data <- forest_data |>
+    mutate(
+      or = odds_ratio, or_lower = ci_lower, or_upper = ci_upper,
+      fdr = FDR, significant = FDR < 0.05,
+      errorbar_color = if_else(FDR < 0.05, "grey30", "gray80"),
+      Organ_Display = case_when(
+        predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        predictor == "Kidney_urinary" ~ "Kidney and Bladder", TRUE ~ str_to_title(predictor)
+      )
+    ) |>
+    arrange(desc(odds_ratio)) |>
+    mutate(y_pos = rev(seq_along(predictor)), Organ_Display = factor(Organ_Display, levels = Organ_Display))
+  
+  x_min <- suppressWarnings(min(forest_data$or_lower, na.rm = TRUE))
+  x_max <- suppressWarnings(max(forest_data$or_upper, na.rm = TRUE))
+  default_lower <- 0.5
+  default_upper <- 1.5
+  
+  if (!is.finite(x_min) || !is.finite(x_max) || x_min <= 0) {
+    x_min <- default_lower
+    x_max <- default_upper
+  }
+  
+  pad <- 0.1 * (x_max - x_min)
+  if (!is.finite(pad) || pad <= 0) pad <- 0.1
+  
+  x_limits <- c(min(default_lower, max(0.1, x_min - pad)), max(default_upper, x_max + pad))
+  legend_x_left <- x_limits[1] + 0.05 * (x_limits[2] - x_limits[1])
+  legend_x_right <- x_limits[1] + 0.55 * (x_limits[2] - x_limits[1])
+  
+  tab <- forest_data |>
+    transmute(
+      y_pos, `Organ age` = Organ_Display,
+      `OR (95% CI)` = sprintf("%.2f (%.2f-%.2f)", or, or_lower, or_upper),
+      FDR = sprintf("%.2e", fdr)
+    )
+  
+  x_pos <- tibble(col = c("Organ age", "OR (95% CI)", "FDR"), x = c(1.0, 3.5, 6.0))
+  table_long <- tab |> pivot_longer(-y_pos, names_to = "col", values_to = "val") |> left_join(x_pos, by = "col")
+  
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3.2) +
+    geom_text(data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), 
+             aes(x = x, y = y_pos, label = col), hjust = c(0, 0, 1), fontface = "bold", 
+             inherit.aes = FALSE, size = 3.3) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 7.0), expand = c(0, 0)) +
+    labs(title = title) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(hjust = 0.1, size = 12), axis.title = element_blank(),
+         axis.text.x = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank(),
+         plot.margin = unit(c(12, 6, 6, 6), "pt"))
+  
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, 
+                 fill = factor(seq_along(predictor) %% 2)), alpha = 0.6, show.legend = FALSE) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(aes(x = 1, xend = 1, y = 0.5, yend = max(forest_data$y_pos) + 0.75), 
+                linetype = "33", color = "grey10", size = 0.7) +
+    geom_errorbarh(data = forest_data, aes(xmin = or_lower, xmax = or_upper, y = y_pos), color = forest_data$errorbar_color, height = 0.15, size = 0.6, inherit.aes = FALSE) +
+    geom_point(aes(x = or, color = significant), size = 2.5, shape = 16) +
+    annotate("text", x = legend_x_left, y = max(forest_data$y_pos) + 1.5, 
+            label = "● Significant (FDR < 0.05)", hjust = 0.35, size = 3, color = "black") +
+    annotate("text", x = legend_x_right, y = max(forest_data$y_pos) + 1.5, 
+            label = "● Non-significant", hjust = -0.65, size = 3, color = "gray80") +
+    scale_color_manual(values = c("TRUE" = "black", "FALSE" = "gray80")) +
+    scale_x_continuous(limits = x_limits, expand = c(0, 0)) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Odds Ratio (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.y = element_blank(), axis.text.x = element_text(size = 9),
+         axis.title.x = element_text(size = 10), panel.grid = element_blank(),
+         plot.margin = unit(c(12, 12, 6, 0), "pt"), legend.position = "none") +
+    coord_cartesian(clip = "off")
+  
+  p_table + p_forest + plot_layout(widths = c(2.5, 2))
+}
+
+# Forest tables for time windows
+for (window_name in names(time_window_discordant)) {
+  tw_data <- time_window_discordant[[window_name]]
+  
+  if (!is.null(tw_data$all) && nrow(tw_data$all) > 0) {
+    diseases_to_plot <- unique(tw_data$all$disease)
+    for (disease_name in diseases_to_plot) {
+      n_pairs <- tw_data$all |> filter(disease == disease_name) |> slice(1) |> pull(n_pairs)
+      plot <- create_discordant_forest(tw_data$all, disease_name, n_pairs, "All Pairs")
+      if (!is.null(plot)) {
+        disease_config <- diseases_config[[disease_name]]
+        display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+        filename <- paste0("forest_all_pairs_", tolower(str_replace_all(display_name, " ", "_")), ".svg")
+        filepath <- file.path(prevalent_disease_base, "within", window_name, filename)
+        save_plot(filepath, plot, width = 10, height = 5, dpi = 300)
+      }
+    }
+  }
+  
+  if (!is.null(tw_data$mz) && nrow(tw_data$mz) > 0) {
+    diseases_to_plot <- unique(tw_data$mz$disease)
+    for (disease_name in diseases_to_plot) {
+      n_pairs <- tw_data$mz |> filter(disease == disease_name) |> slice(1) |> pull(n_pairs)
+      plot <- create_discordant_forest(tw_data$mz, disease_name, n_pairs, "MZ Pairs")
+      if (!is.null(plot)) {
+        disease_config <- diseases_config[[disease_name]]
+        display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+        filename <- paste0("forest_mz_pairs_", tolower(str_replace_all(display_name, " ", "_")), ".svg")
+        filepath <- file.path(prevalent_disease_base, "within", window_name, filename)
+        save_plot(filepath, plot, width = 10, height = 5, dpi = 300)
+      }
+    }
+  }
+  
+  # Create CSV tables directory for this time window - within-pair results
+  csv_dir_within_prevalent <- file.path(prevalent_disease_base, "within", window_name, "tables")
+  dir.create(csv_dir_within_prevalent, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save CSV for all pairs
+  if (!is.null(tw_data$all) && nrow(tw_data$all) > 0) {
+    for (disease_name in unique(tw_data$all$disease)) {
+      disease_data <- tw_data$all |> filter(disease == disease_name, !is.na(odds_ratio))
+      
+      if (nrow(disease_data) == 0) next
+      
+      tab <- disease_data |>
+        mutate(
+          use_sci = pmax(abs(odds_ratio), abs(ci_lower), abs(ci_upper), na.rm = TRUE) >= 10,
+          use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+          or_formatted = if_else(use_sci,
+            sprintf("%.1e (%.1e-%.1e)", odds_ratio, ci_lower, ci_upper),
+            sprintf("%.2f (%.2f-%.2f)", odds_ratio, ci_lower, ci_upper)),
+          Organ_Display = case_when(
+            predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+            predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+            TRUE ~ str_to_title(predictor)
+          )
+        ) |>
+        select(Organ = Organ_Display, `OR (95% CI)` = or_formatted, FDR)
+      
+      disease_config <- diseases_config[[disease_name]]
+      display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+      filename <- paste0("prevalent_", tolower(str_replace_all(display_name, " ", "_")), "_all_pairs.csv")
+      write.csv(tab, file = file.path(csv_dir_within_prevalent, filename), row.names = FALSE)
+    }
+  }
+  
+  # Save CSV for MZ pairs
+  if (!is.null(tw_data$mz) && nrow(tw_data$mz) > 0) {
+    for (disease_name in unique(tw_data$mz$disease)) {
+      disease_data <- tw_data$mz |> filter(disease == disease_name, !is.na(odds_ratio))
+      
+      if (nrow(disease_data) == 0) next
+      
+      tab <- disease_data |>
+        mutate(
+          use_sci = pmax(abs(odds_ratio), abs(ci_lower), abs(ci_upper), na.rm = TRUE) >= 10,
+          use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+          or_formatted = if_else(use_sci,
+            sprintf("%.1e (%.1e-%.1e)", odds_ratio, ci_lower, ci_upper),
+            sprintf("%.2f (%.2f-%.2f)", odds_ratio, ci_lower, ci_upper)),
+          Organ_Display = case_when(
+            predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+            predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+            TRUE ~ str_to_title(predictor)
+          )
+        ) |>
+        select(Organ = Organ_Display, `OR (95% CI)` = or_formatted, FDR)
+      
+      disease_config <- diseases_config[[disease_name]]
+      display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+      filename <- paste0("prevalent_", tolower(str_replace_all(display_name, " ", "_")), "_mz_pairs.csv")
+      write.csv(tab, file = file.path(csv_dir_within_prevalent, filename), row.names = FALSE)
+    }
+  }
+}
+
+cat("\n=== Within-Pair Analysis Complete ===\n")
+```
+
+## Within-Pair Difference Analysis for Continuous Outcomes
+
+**Analysis Goal:**
+Examine associations between organ ages and continuous outcomes using within-pair difference regression. This approach controls for all shared genetic and environmental factors within twin pairs by regressing the within-pair difference in the outcome on the within-pair difference in organ age.
+
+**Model:** `outcome_diff ~ organ_age_diff` (where differences are calculated within each pair)  
+**Method:** Linear regression on within-pair differences  
+**Multiple testing:** FDR correction applied across all tests
+
+```{r within_pair_continuous_function}
+analyze_continuous_within_pair <- function(predictor_df, outcome_vars = cont_outcomes, mz_only = FALSE) {
+  map_dfr(outcome_vars, function(outcome) {
+    if (!(outcome %in% names(twins_analysis))) {
+      return(tibble(
+        outcome = outcome, predictor = NA_character_,
+        estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+        standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+        error_message = "Variable not found in dataset"
+      ))
+    }
+
+    predictors <- setdiff(colnames(predictor_df), "twin_id")
+
+    map_dfr(predictors, function(predictor) {
+      # Prepare data with organ age
+      analysis_data <- twins_analysis |>
+        left_join(predictor_df |> select(twin_id, all_of(predictor)), by = "twin_id") |>
+        filter(!is.na(!!sym(outcome)), !is.na(!!sym(predictor)))
+
+      # Handle sex-specific organ ages
+      if (predictor == "Ovary") {
+        analysis_data <- analysis_data |> filter(sex == 2)
+      } else if (predictor == "Prostate") {
+        analysis_data <- analysis_data |> filter(sex == 1)
+      }
+
+      # Filter to complete pairs
+      complete_pairs <- analysis_data |>
+        group_by(pair_id) |>
+        filter(
+          n() == 2,
+          if (mz_only) all(bestzyg == 1) else TRUE
+        ) |>
+        ungroup()
+
+      if (n_distinct(complete_pairs$pair_id) < 3) {
+        return(tibble(
+          outcome = outcome, predictor = predictor,
+          estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+          standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+          error_message = "Insufficient pairs"
+        ))
+      }
+
+      # Calculate within-pair differences
+      pair_diffs <- complete_pairs |>
+        group_by(pair_id) |>
+        summarise(
+          outcome_diff = .data[[outcome]][1] - .data[[outcome]][2],
+          predictor_diff = .data[[predictor]][1] - .data[[predictor]][2],
+          .groups = "drop"
+        ) |>
+        filter(!is.na(outcome_diff), !is.na(predictor_diff))
+
+      if (nrow(pair_diffs) < 3) {
+        return(tibble(
+          outcome = outcome, predictor = predictor,
+          estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+          standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+          error_message = "Insufficient pairs after calculating differences"
+        ))
+      }
+
+      tryCatch({
+        # Fit model: outcome_diff ~ predictor_diff
+        model <- lm(outcome_diff ~ predictor_diff, data = pair_diffs)
+        
+        # Extract coefficients (predictor_diff is the second coefficient after intercept)
+        estimate <- coef(model)[2]
+        std_error <- summary(model)$coefficients[2, "Std. Error"]
+        t_value <- summary(model)$coefficients[2, "t value"]
+        p_value <- summary(model)$coefficients[2, "Pr(>|t|)"]
+
+        # Calculate standardized estimates using SD of differences
+        sd_outcome_diff <- sd(pair_diffs$outcome_diff, na.rm = TRUE)
+        sd_predictor_diff <- sd(pair_diffs$predictor_diff, na.rm = TRUE)
+        standardized_estimate <- estimate * (sd_predictor_diff / sd_outcome_diff)
+        standardized_ci_lower <- (estimate - 1.96 * std_error) * (sd_predictor_diff / sd_outcome_diff)
+        standardized_ci_upper <- (estimate + 1.96 * std_error) * (sd_predictor_diff / sd_outcome_diff)
+
+        tibble(
+          outcome = outcome, predictor = predictor,
+          estimate = estimate, std_error = std_error,
+          z_value = t_value, p_value = p_value,
+          standardized_estimate = standardized_estimate,
+          standardized_ci_lower = standardized_ci_lower,
+          standardized_ci_upper = standardized_ci_upper,
+          error_message = NA_character_
+        )
+      }, error = function(e) {
+        tibble(
+          outcome = outcome, predictor = predictor,
+          estimate = NA_real_, std_error = NA_real_, z_value = NA_real_, p_value = NA_real_,
+          standardized_estimate = NA_real_, standardized_ci_lower = NA_real_, standardized_ci_upper = NA_real_,
+          error_message = e$message
+        )
+      })
+    })
+  }) |>
+    mutate(FDR = p.adjust(p_value, method = "fdr"))
+}
+```
+
+```{r run_within_pair_continuous_analyses}
+# Run within-pair analyses for all continuous outcomes
+cont_within_pair_all <- analyze_continuous_within_pair(organ_age_mortality, cont_outcomes, mz_only = FALSE) |>
+  mutate(
+    model_type = "linear",
+    organ_age_model = "mortality",
+    analysis_type = "within_pair",
+    pair_type = "all"
+  )
+
+cont_within_pair_mz <- analyze_continuous_within_pair(organ_age_mortality, cont_outcomes, mz_only = TRUE) |>
+  mutate(
+    model_type = "linear",
+    organ_age_model = "mortality",
+    analysis_type = "within_pair",
+    pair_type = "mz"
+  )
+```
+
+```{r combine_within_pair_results}
+# Combine continuous and binary (smoking/exercise) within-pair results
+all_within_pair_all <- bind_rows(
+  cont_within_pair_all,
+  smoking_within_pair_all,
+  exercise_within_pair_all
+)
+
+all_within_pair_mz <- bind_rows(
+  cont_within_pair_mz,
+  smoking_within_pair_mz,
+  exercise_within_pair_mz
+)
+```
+
+```{r within_pair_continuous_heatmaps}
+# Prepare heatmap data for within-pair analyses
+within_pair_heatmap_data_all <- cont_within_pair_all |>
+  filter(is.na(error_message)) |>
+  mutate(
+    effect_size = standardized_estimate,
+    significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01 ~ "**",
+      FDR < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    outcome_group = case_when(
+      outcome %in% lifestyle_outcomes ~ "Lifestyle",
+      outcome %in% clinical_biomarkers ~ "Clinical Biomarkers",
+      outcome %in% health_outcomes ~ "Health",
+      TRUE ~ "Other"
+    )
+  ) |>
+  select(outcome, predictor, effect_size, significance, outcome_group, model_type) |>
+  clean_names()
+
+# Add smoking and exercise results to heatmap data - All Pairs
+smoking_exercise_heatmap_all <- bind_rows(
+  smoking_within_pair_all,
+  exercise_within_pair_all
+) |>
+  filter(is.na(error_message)) |>
+  mutate(
+    effect_size = standardized_estimate,
+    significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01 ~ "**",
+      FDR < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    outcome_group = "Lifestyle"
+  ) |>
+  select(outcome, predictor, effect_size, significance, outcome_group, model_type) |>
+  clean_names()
+
+within_pair_heatmap_data_all <- bind_rows(
+  within_pair_heatmap_data_all,
+  smoking_exercise_heatmap_all
+)
+
+within_pair_heatmap_data_mz <- cont_within_pair_mz |>
+  filter(is.na(error_message)) |>
+  mutate(
+    effect_size = standardized_estimate,
+    significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01 ~ "**",
+      FDR < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    outcome_group = case_when(
+      outcome %in% lifestyle_outcomes ~ "Lifestyle",
+      outcome %in% clinical_biomarkers ~ "Clinical Biomarkers",
+      outcome %in% health_outcomes ~ "Health",
+      TRUE ~ "Other"
+    )
+  ) |>
+  select(outcome, predictor, effect_size, significance, outcome_group, model_type) |>
+  clean_names()
+
+# Add smoking and exercise results to heatmap data - MZ Pairs
+smoking_exercise_heatmap_mz <- bind_rows(
+  smoking_within_pair_mz,
+  exercise_within_pair_mz
+) |>
+  filter(is.na(error_message)) |>
+  mutate(
+    effect_size = standardized_estimate,
+    significance = case_when(
+      FDR < 0.001 ~ "***",
+      FDR < 0.01 ~ "**",
+      FDR < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    outcome_group = "Lifestyle"
+  ) |>
+  select(outcome, predictor, effect_size, significance, outcome_group, model_type) |>
+  clean_names()
+
+within_pair_heatmap_data_mz <- bind_rows(
+  within_pair_heatmap_data_mz,
+  smoking_exercise_heatmap_mz
+)
+
+# Create heatmaps for each group - All Pairs
+within_pair_lifestyle_heatmap_all <- create_group_heatmap(within_pair_heatmap_data_all, "Lifestyle")
+within_pair_clinical_heatmap_all <- create_group_heatmap(within_pair_heatmap_data_all, "Clinical Biomarkers")
+within_pair_health_heatmap_all <- create_group_heatmap(within_pair_heatmap_data_all, "Health")
+
+# Create heatmaps for each group - MZ Pairs
+within_pair_lifestyle_heatmap_mz <- create_group_heatmap(within_pair_heatmap_data_mz, "Lifestyle")
+within_pair_clinical_heatmap_mz <- create_group_heatmap(within_pair_heatmap_data_mz, "Clinical Biomarkers")
+within_pair_health_heatmap_mz <- create_group_heatmap(within_pair_heatmap_data_mz, "Health")
+
+# Print heatmaps - All Pairs
+print(within_pair_lifestyle_heatmap_all)
+print(within_pair_clinical_heatmap_all)
+print(within_pair_health_heatmap_all)
+
+# Save heatmaps - All Pairs
+save_plot(
+  filename = file.path(current_health_base, "within_pair", "heatmap", "all_pairs_lifestyle.svg"),
+  plot = within_pair_lifestyle_heatmap_all,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "within_pair", "heatmap", "all_pairs_clinical.svg"),
+  plot = within_pair_clinical_heatmap_all,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "within_pair", "heatmap", "all_pairs_health.svg"),
+  plot = within_pair_health_heatmap_all,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+# Save heatmaps - MZ Pairs
+save_plot(
+  filename = file.path(current_health_base, "within_pair", "heatmap", "mz_pairs_lifestyle.svg"),
+  plot = within_pair_lifestyle_heatmap_mz,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "within_pair", "heatmap", "mz_pairs_clinical.svg"),
+  plot = within_pair_clinical_heatmap_mz,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+
+save_plot(
+  filename = file.path(current_health_base, "within_pair", "heatmap", "mz_pairs_health.svg"),
+  plot = within_pair_health_heatmap_mz,
+  width = 12,
+  height = 6,
+  dpi = 300
+)
+```
+
+```{r within_pair_continuous_forest_tables}
+# Create output directory
+output_dir_within_pair <- file.path(current_health_base, "within_pair", "forest_table")
+dir.create(output_dir_within_pair, showWarnings = FALSE, recursive = TRUE)
+
+# Helper function to create forest table for within-pair results
+create_within_pair_forest_table <- function(data, outcome_name, pair_type_label, main_color = "black") {
+  forest_data <- data |>
+    filter(outcome == outcome_name, is.na(error_message))
+
+  if (nrow(forest_data) == 0) return(NULL)
+
+  display_name <- case_when(
+    outcome_name == "whr" ~ "Waist-Hip Ratio",
+    outcome_name == "bmi" ~ "Body Mass Index",
+    outcome_name == "edyrs" ~ "Education Years",
+    outcome_name == "glucose" ~ "Glucose",
+    outcome_name == "triglycerides" ~ "Triglycerides",
+    outcome_name == "hba1c" ~ "HbA1c",
+    outcome_name == "crp" ~ "C-Reactive Protein",
+    outcome_name == "total_hdl_ratio" ~ "Total/HDL Ratio",
+    outcome_name == "egfr_cr_cys" ~ "eGFR",
+    outcome_name == "fi_10" ~ "Frailty Index",
+    outcome_name == "telomere_length" ~ "Telomere Length",
+    outcome_name == "eversmok" ~ "Ever Smoked",
+    outcome_name == "exercise_how_often" ~ "Exercise Frequency",
+    TRUE ~ outcome_name
+  )
+
+  forest_data <- forest_data |>
+    mutate(
+      effect_size = standardized_estimate,
+      effect_lower = standardized_ci_lower,
+      effect_upper = standardized_ci_upper,
+      significant = FDR < 0.05,
+      errorbar_color = if_else(FDR < 0.05, "grey30", "gray80"),
+      Organ_Display = case_when(
+        predictor == "Brain" ~ "Brain",
+        predictor == "Cardiovascular" ~ "Cardiovascular",
+        predictor == "Kidney_urinary" ~ "Kidney and Bladder",
+        predictor == "Immune" ~ "Immune",
+        predictor == "Liver" ~ "Liver",
+        predictor == "Adipose" ~ "Adipose",
+        predictor == "Endocrine" ~ "Endocrine",
+        predictor == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        predictor == "Lung" ~ "Lung",
+        predictor == "Muscle" ~ "Muscle",
+        predictor == "Nerve" ~ "Nerve",
+        predictor == "Pancreas" ~ "Pancreas",
+        predictor == "Skin" ~ "Skin",
+        predictor == "Ovary" ~ "Ovary",
+        predictor == "Prostate" ~ "Prostate",
+        TRUE ~ predictor
+      )
+    ) |>
+    arrange(desc(effect_size)) |>
+    mutate(
+      y_pos = rev(seq_along(predictor)),
+      Organ_Display = factor(Organ_Display, levels = unique(Organ_Display))
+    )
+
+  x_min <- min(forest_data$effect_lower, na.rm = TRUE)
+  x_max <- max(forest_data$effect_upper, na.rm = TRUE)
+  pad <- 0.1 * (x_max - x_min)
+  x_limits <- c(min(-0.5, x_min - pad), max(0.5, x_max + pad))
+
+  legend_x_left <- x_limits[1] + 0.05 * (x_limits[2] - x_limits[1])
+  legend_x_right <- x_limits[1] + 0.55 * (x_limits[2] - x_limits[1])
+
+  tab <- forest_data |>
+    transmute(
+      y_pos,
+      `Organ age` = Organ_Display,
+      `Effect Size` = sprintf("%.2f (%.2f-%.2f)", effect_size, effect_lower, effect_upper),
+      `FDR` = sprintf("%.2e", FDR)
+    )
+
+  x_pos <- tibble(col = c("Organ age", "Effect Size", "FDR"), x = c(1.0, 3.5, 6.0))
+  table_long <- tab |>
+    pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    left_join(x_pos, by = "col")
+
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3.2) +
+    geom_text(
+      data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1),
+      aes(x = x, y = y_pos, label = col),
+      hjust = c(0, 0, 1),
+      fontface = "bold",
+      inherit.aes = FALSE,
+      size = 3.3
+    ) +
+    scale_y_continuous(breaks = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 7.0), expand = c(0, 0)) +
+    labs(title = paste0(display_name, " - ", pair_type_label)) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(hjust = 0.1, size = 12),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      plot.margin = unit(c(12, 6, 6, 6), "pt")
+    )
+
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(
+      aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5,
+          fill = factor(seq_along(predictor) %% 2)),
+      alpha = 0.6, show.legend = FALSE
+    ) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(
+      aes(x = 0, xend = 0, y = 0.5, yend = max(forest_data$y_pos) + 0.75),
+      linetype = "33", color = "grey10", size = 0.7
+    ) +
+    geom_errorbarh(
+      data = forest_data, aes(xmin = effect_lower, xmax = effect_upper, y = y_pos),
+      color = forest_data$errorbar_color, height = 0.15, size = 0.6, inherit.aes = FALSE
+    ) +
+    geom_point(aes(x = effect_size, color = significant), size = 2.5, shape = 16) +
+    annotate(
+      "text", x = legend_x_left, y = max(forest_data$y_pos) + 1.5,
+      label = "● Significant (FDR < 0.05)", hjust = 0.35, size = 3, color = main_color
+    ) +
+    annotate(
+      "text", x = legend_x_right, y = max(forest_data$y_pos) + 1.5,
+      label = "● Non-significant", hjust = -0.65, size = 3, color = "gray80"
+    ) +
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(limits = x_limits, expand = c(0, 0)) +
+    scale_y_continuous(breaks = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Standardized Effect (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.y = element_blank(),
+      axis.text.x = element_text(size = 9),
+      axis.title.x = element_text(size = 10),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.margin = unit(c(12, 12, 6, 0), "pt"),
+      legend.position = "none"
+    ) +
+    coord_cartesian(clip = "off")
+
+  p_table + p_forest + plot_layout(widths = c(2.5, 2))
+}
+
+# Create and save forest plots for all continuous outcomes - All Pairs
+for (outcome_name in cont_outcomes) {
+  plot <- create_within_pair_forest_table(cont_within_pair_all, outcome_name, "All Pairs")
+
+  if (!is.null(plot)) {
+    save_plot(
+      filename = file.path(output_dir_within_pair, paste0("forest_", outcome_name, "_all_pairs.svg")),
+      plot = plot,
+      width = 8,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+
+# Create CSV tables directory for within-pair results
+csv_dir_within <- file.path(current_health_base, "within_pair", "tables")
+dir.create(csv_dir_within, showWarnings = FALSE, recursive = TRUE)
+
+# Save CSV for all pairs
+for (outcome_name in cont_outcomes) {
+  outcome_data <- cont_within_pair_all |> 
+    filter(outcome == outcome_name, is.na(error_message))
+  
+  if (nrow(outcome_data) == 0) next
+  
+  tab <- outcome_data |>
+    mutate(
+      use_sci = pmax(abs(standardized_estimate), abs(standardized_ci_lower), abs(standardized_ci_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      effect_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", standardized_estimate, standardized_ci_lower, standardized_ci_upper),
+        sprintf("%.2f (%.2f-%.2f)", standardized_estimate, standardized_ci_lower, standardized_ci_upper)),
+      Organ_Display = predictor
+    ) |>
+    select(Organ = Organ_Display, `Effect Size (95% CI)` = effect_formatted, FDR)
+  
+  write.csv(tab, file = file.path(csv_dir_within, paste0(outcome_name, "_all_pairs.csv")), row.names = FALSE)
+}
+
+# Create and save forest plots for all continuous outcomes - MZ Pairs
+for (outcome_name in cont_outcomes) {
+  plot <- create_within_pair_forest_table(cont_within_pair_mz, outcome_name, "MZ Pairs")
+
+  if (!is.null(plot)) {
+    save_plot(
+      filename = file.path(output_dir_within_pair, paste0("forest_", outcome_name, "_mz_pairs.svg")),
+      plot = plot,
+      width = 8,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+
+# Save CSV for MZ pairs  
+for (outcome_name in cont_outcomes) {
+  outcome_data <- cont_within_pair_mz |> 
+    filter(outcome == outcome_name, is.na(error_message))
+  
+  if (nrow(outcome_data) == 0) next
+  
+  tab <- outcome_data |>
+    mutate(
+      use_sci = pmax(abs(standardized_estimate), abs(standardized_ci_lower), abs(standardized_ci_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      effect_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", standardized_estimate, standardized_ci_lower, standardized_ci_upper),
+        sprintf("%.2f (%.2f-%.2f)", standardized_estimate, standardized_ci_lower, standardized_ci_upper)),
+      Organ_Display = predictor
+    ) |>
+    select(Organ = Organ_Display, `Effect Size (95% CI)` = effect_formatted, FDR)
+  
+  write.csv(tab, file = file.path(csv_dir_within, paste0(outcome_name, "_mz_pairs.csv")), row.names = FALSE)
+}
+```
+
+```{r create_binary_within_pair_forest_tables}
+# Create forest tables for smoking and exercise using within-pair style
+# Save to same directory as continuous outcomes
+binary_outcomes_for_forest <- c("eversmok", "exercise_how_often")
+
+# Create and save forest plots for binary outcomes - All Pairs
+for (outcome_name in binary_outcomes_for_forest) {
+  plot <- create_within_pair_forest_table(all_within_pair_all, outcome_name, "All Pairs")
+
+  if (!is.null(plot)) {
+    save_plot(
+      filename = file.path(output_dir_within_pair, paste0("forest_", outcome_name, "_all_pairs.svg")),
+      plot = plot,
+      width = 8,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+
+# Create and save forest plots for binary outcomes - MZ Pairs
+for (outcome_name in binary_outcomes_for_forest) {
+  plot <- create_within_pair_forest_table(all_within_pair_mz, outcome_name, "MZ Pairs")
+
+  if (!is.null(plot)) {
+    save_plot(
+      filename = file.path(output_dir_within_pair, paste0("forest_", outcome_name, "_mz_pairs.svg")),
+      plot = plot,
+      width = 8,
+      height = 5,
+      dpi = 300
+    )
+  }
+}
+
+# Save CSV for binary outcomes - all pairs
+for (outcome_name in binary_outcomes_for_forest) {
+  outcome_data <- all_within_pair_all |> 
+    filter(outcome == outcome_name, is.na(error_message))
+  
+  if (nrow(outcome_data) == 0) next
+  
+  tab <- outcome_data |>
+    mutate(
+      use_sci = pmax(abs(standardized_estimate), abs(standardized_ci_lower), abs(standardized_ci_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      effect_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", standardized_estimate, standardized_ci_lower, standardized_ci_upper),
+        sprintf("%.2f (%.2f-%.2f)", standardized_estimate, standardized_ci_lower, standardized_ci_upper)),
+      Organ_Display = predictor
+    ) |>
+    select(Organ = Organ_Display, `Effect Size (95% CI)` = effect_formatted, FDR)
+  
+  write.csv(tab, file = file.path(csv_dir_within, paste0(outcome_name, "_all_pairs.csv")), row.names = FALSE)
+}
+
+# Save CSV for binary outcomes - MZ pairs
+for (outcome_name in binary_outcomes_for_forest) {
+  outcome_data <- all_within_pair_mz |> 
+    filter(outcome == outcome_name, is.na(error_message))
+  
+  if (nrow(outcome_data) == 0) next
+  
+  tab <- outcome_data |>
+    mutate(
+      use_sci = pmax(abs(standardized_estimate), abs(standardized_ci_lower), abs(standardized_ci_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      effect_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", standardized_estimate, standardized_ci_lower, standardized_ci_upper),
+        sprintf("%.2f (%.2f-%.2f)", standardized_estimate, standardized_ci_lower, standardized_ci_upper)),
+      Organ_Display = predictor
+    ) |>
+    select(Organ = Organ_Display, `Effect Size (95% CI)` = effect_formatted, FDR)
+  
+  write.csv(tab, file = file.path(csv_dir_within, paste0(outcome_name, "_mz_pairs.csv")), row.names = FALSE)
+}
+```

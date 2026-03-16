@@ -1,0 +1,393 @@
+---
+title: "Combined Olink and MS Mortality Clocks"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+    code_folding: hide
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.width = 10, fig.height = 6, fig.align = 'center'
+)
+
+# Set global seed for reproducibility
+set.seed(350)
+```
+
+# Introduction
+
+This notebook builds GLS-based organ mortality clocks from combined Mass Spectrometry (MS) and Olink protein measurements.
+
+## Data Loading and Preparation
+
+```{r load-libraries}
+library(tidyverse)
+library(tidymodels)
+library(forcats)
+library(survival)
+
+# Prefer dplyr verbs in this notebook
+select = dplyr::select
+rename = dplyr::rename
+```
+
+```{r load-data}
+# Input: protein measurements
+input_protein_measurements_file <- "PATH/TO/input_protein_measurements.csv"
+
+# Input: participant metadata / covariates
+input_metadata_file <- "PATH/TO/input_metadata.csv"
+
+# Input: shared model functions
+input_model_functions_file <- "PATH/TO/model_functions.R"
+if (!file.exists(input_model_functions_file)) {
+  stop("Set `input_model_functions_file` to a valid path before running.")
+}
+
+comb <- read_csv(input_protein_measurements_file)
+twins <- read_csv(input_metadata_file) |> 
+  mutate(sex = as.factor(sex))
+
+# Source model functions
+source(input_model_functions_file)
+
+# Prepare mortality data
+mortality_data <- comb |> 
+  left_join(twins |> select(twin_id, age, sex, pair_id, time = time_to_death, status = deceased), by = "twin_id")
+```
+
+
+# Utility Functions
+
+```{r utility-functions}
+ensure_parent_dir <- function(path) {
+  dir.create(dirname(path), showWarnings = FALSE, recursive = TRUE)
+}
+
+plot_performance_metrics <- function(data, metric_col, title, color = "steelblue") {
+  ggplot(data, aes(x = reorder(clock, !!sym(metric_col)), y = !!sym(metric_col))) +
+    geom_bar(stat = "identity", fill = color, alpha = 0.7) +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = title, x = "Organ Clock", y = str_to_title(metric_col)) +
+    theme(plot.title = element_text(hjust = 0.5), axis.text.y = element_text(size = 8)) +
+    geom_text(aes(label = sprintf("%.3f", !!sym(metric_col))), hjust = -0.2, size = 3) +
+    ylim(0, max(data[[metric_col]], na.rm = TRUE) * 1.1) +
+    theme(panel.grid = element_blank())
+}
+```
+
+# GLS-Based Organ-Specific Analysis
+
+This section defines organ-specific predictor sets from GLS labels and trains mortality clocks with pair-aware out-of-fold (OOF) validation.
+
+Modeling setup:
+- Mortality clocks fit with Cox models
+- Pair-aware outer and inner cross-validation
+- Alpha tuning per outer fold by lowest CV deviance
+- Sex-specific models for male and female participants
+- OOF predictions used for performance summaries
+
+## GLS Protein Set Preparation
+
+```{r gls-analysis}
+# Input: feature set definitions
+input_feature_set_file <- "PATH/TO/input_feature_set_definitions.csv"
+gls_info <- read_csv(input_feature_set_file)
+
+gls_predictor_sets <- list()
+
+gls_info |>
+  na.omit(clean_label_string) |> 
+  separate_rows(clean_label_string, sep = "\\.") |>
+  mutate(clean_label_string = str_trim(clean_label_string)) |>
+  group_by(clean_label_string) |>
+  summarise(
+    proteins = list(unique(protein)),
+    n_proteins = n_distinct(protein),
+    .groups = "drop"
+  ) |>
+  filter(n_proteins >= 2) |>
+  pwalk(function(clean_label_string, proteins, n_proteins) {
+    gls_predictor_sets[[clean_label_string]] <<- proteins
+  })
+
+```
+
+# Model Training and Export
+
+This section runs the OOF training pipeline, exports predictions and parameters for downstream analyses, and refits final models using OOF-selected alpha values.
+
+```{r oof-train}
+# Computationally intensive step: OOF mortality clocks
+gls_oof_mortality <- create_oof_tuned_mortality_clock(
+  df = mortality_data,
+  predictors = gls_predictor_sets,
+  time_col = "time",
+  status_col = "status",
+  age_col = "age",
+  loess = TRUE,
+  outer_folds = 5,
+  inner_folds = 5,
+  alpha_grid = seq(0, 1, by = 0.1),
+  seed = 350
+)
+invisible(NULL)
+```
+
+```{r export-results}
+# Exports and refit (depends on gls_oof_mortality from oof-train chunk)
+gls_tuned_mortality_data <- gls_oof_mortality$oof_pred_wide
+
+# Output: OOF predictions
+output_predictions_file <- "PATH/TO/output_predictions.csv"
+ensure_parent_dir(output_predictions_file)
+write_csv(
+  gls_tuned_mortality_data,
+  output_predictions_file
+)
+
+# Output: alpha summary from OOF tuning
+output_alpha_summary_file <- "PATH/TO/output_alpha_summary.csv"
+ensure_parent_dir(output_alpha_summary_file)
+write_csv(
+  gls_oof_mortality$alpha_summary,
+  output_alpha_summary_file
+)
+
+# OOF performance metrics in long format
+oof_metrics_long <- gls_oof_mortality$oof_pred_long |>
+  left_join(mortality_data |> select(twin_id, time, status, sex), by = "twin_id") |>
+  tidyr::drop_na(time, status, .pred) |>
+  mutate(sex = if_else(sex == 1, "male", "female")) |>
+  group_by(organ, sex) |>
+  summarise(
+    concordance = 1 - survival::concordance(Surv(time, status) ~ .pred)$concordance,
+    age_correlation = cor(age, .pred, use = "complete.obs"),
+    .groups = "drop"
+  ) |>
+  pivot_longer(cols = c(concordance, age_correlation), names_to = ".metric", values_to = ".estimate") |>
+  mutate(
+    .estimator = if_else(.metric == "concordance", "standard", "pearson"),
+    split = "oof",
+    clock = organ
+  ) |>
+  select(clock, sex, split, .metric, .estimator, .estimate)
+
+# Output: OOF metrics
+output_metrics_oof_file <- "PATH/TO/output_metrics_oof.csv"
+ensure_parent_dir(output_metrics_oof_file)
+write_csv(
+  oof_metrics_long,
+  output_metrics_oof_file
+)
+
+# OOF performance plots
+oof_concordance_data <- oof_metrics_long |>
+  filter(.metric == "concordance") |>
+  group_by(clock) |>
+  summarise(concordance = mean(.estimate, na.rm = TRUE), .groups = "drop")
+
+oof_age_corr_data <- oof_metrics_long |>
+  filter(.metric == "age_correlation") |>
+  group_by(clock) |>
+  summarise(correlation = mean(.estimate, na.rm = TRUE), .groups = "drop")
+
+gls_oof_concordance_plot <- plot_performance_metrics(
+  oof_concordance_data, "concordance",
+  "GLS OOF Mortality Model Performance - Concordance Values",
+  "darkred"
+)
+gls_oof_concordance_plot
+
+gls_oof_age_corr_plot <- plot_performance_metrics(
+  oof_age_corr_data, "correlation",
+  "GLS OOF Mortality Model Performance - Age Correlation Values",
+  "darkgreen"
+)
+gls_oof_age_corr_plot
+
+# Output: performance plots
+output_plot_concordance_png <- "PATH/TO/output_concordance.png"
+output_plot_age_correlation_png <- "PATH/TO/output_age_correlation.png"
+ensure_parent_dir(output_plot_concordance_png)
+ensure_parent_dir(output_plot_age_correlation_png)
+ggsave(output_plot_concordance_png, gls_oof_concordance_plot, width = 10, height = 6, dpi = 150)
+ggsave(output_plot_age_correlation_png, gls_oof_age_corr_plot, width = 10, height = 6, dpi = 150)
+
+# Output: scaling information
+output_scaling_info_file <- "PATH/TO/output_scaling_info.csv"
+ensure_parent_dir(output_scaling_info_file)
+gls_mortality_scaling_info <- extract_scaling_info_from_oof(gls_oof_mortality$oof_pred_long, model_type = "mortality")
+write_csv(
+  gls_mortality_scaling_info,
+  output_scaling_info_file
+)
+
+# Output: canonical metrics table used downstream
+output_metrics_main_file <- "PATH/TO/output_metrics_main.csv"
+ensure_parent_dir(output_metrics_main_file)
+write_csv(
+  oof_metrics_long,
+  output_metrics_main_file
+)
+
+# Alpha parameters from OOF tuning
+gls_alpha_df_oof <- gls_oof_mortality$alpha_summary |>
+  select(clock = organ, male_alpha = male_best_alpha_mean, female_alpha = female_best_alpha_mean)
+
+# Output: selected alpha parameters
+output_alpha_parameters_file <- "PATH/TO/output_alpha_parameters.csv"
+ensure_parent_dir(output_alpha_parameters_file)
+write_csv(
+  gls_alpha_df_oof,
+  output_alpha_parameters_file
+)
+
+# Refit on full data using OOF-selected alphas; save model object for downstream analyses
+alpha_summary_refit <- gls_oof_mortality$alpha_summary |>
+  select(organ, male_best_alpha_mean, female_best_alpha_mean)
+alpha_results_refit <- set_names(
+  map(seq_len(nrow(alpha_summary_refit)), function(i) list(
+    male_best_alpha = alpha_summary_refit$male_best_alpha_mean[i],
+    female_best_alpha = alpha_summary_refit$female_best_alpha_mean[i]
+  )),
+  alpha_summary_refit$organ
+)
+gls_refit_oof <- create_refit_tuned_mortality_clock(
+  df = mortality_data,
+  predictors = gls_predictor_sets,
+  alpha_results = alpha_results_refit,
+  time_col = "time",
+  status_col = "status",
+  age_col = "age",
+  loess = TRUE,
+  nfolds = 5,
+  seed = 350
+)
+gls_tuned_mortality_clocks <- set_names(gls_refit_oof$models, names(gls_predictor_sets))
+
+# Output: final fitted model object
+output_model_rds_file <- "PATH/TO/output_model.rds"
+ensure_parent_dir(output_model_rds_file)
+saveRDS(gls_tuned_mortality_clocks, output_model_rds_file)
+
+# OOF summary figures for results output
+# Output: summary figures
+output_plot_cindex_svg <- "PATH/TO/output_cindex.svg"
+output_plot_cindex_pdf <- "PATH/TO/output_cindex.pdf"
+output_plot_age_bar_svg <- "PATH/TO/output_age_bar.svg"
+output_plot_age_bar_pdf <- "PATH/TO/output_age_bar.pdf"
+ensure_parent_dir(output_plot_cindex_svg)
+ensure_parent_dir(output_plot_cindex_pdf)
+ensure_parent_dir(output_plot_age_bar_svg)
+ensure_parent_dir(output_plot_age_bar_pdf)
+
+oof_cindex_noconv <- oof_concordance_data |>
+  filter(tolower(clock) != "conventional") |>
+  arrange(concordance) |>
+  mutate(clock = fct_inorder(clock))
+
+gls_oof_cindex_lollipop <- ggplot(oof_cindex_noconv, aes(x = concordance, y = clock)) +
+  geom_segment(aes(x = 0.65, xend = concordance, y = clock, yend = clock, color = concordance),
+               linewidth = 1, show.legend = FALSE) +
+  geom_point(aes(x = concordance, color = concordance), size = 4, alpha = 1, show.legend = FALSE) +
+  scale_color_gradient(low = "lightpink", high = "darkred") +
+  theme_minimal() +
+  labs(x = "C-index", y = "") +
+  theme(
+    axis.text.y = element_text(size = 10, family = "Helvetica"),
+    axis.text.x = element_text(size = 10, family = "Helvetica"),
+    axis.title.x = element_text(family = "Helvetica"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  ) +
+  geom_text(aes(label = sprintf("%.2f", concordance), color = concordance),
+            hjust = -0.3, size = 3.5, show.legend = FALSE) +
+  scale_x_continuous(limits = c(0.65, 0.8), breaks = c(0.65, 0.7, 0.75, 0.8))
+gls_oof_cindex_lollipop
+
+ggsave(output_plot_cindex_svg, gls_oof_cindex_lollipop, device = "svg", width = 5, height = 3)
+ggsave(output_plot_cindex_pdf, gls_oof_cindex_lollipop, device = "pdf", width = 4, height = 3)
+
+oof_age_corr_noconv <- oof_age_corr_data |>
+  filter(tolower(clock) != "conventional") |>
+  arrange(desc(correlation)) |>
+  mutate(clock = fct_inorder(clock))
+
+gls_oof_age_corr_bar <- ggplot(oof_age_corr_noconv, aes(x = reorder(clock, -correlation), y = correlation, fill = correlation)) +
+  geom_bar(stat = "identity", alpha = 1, show.legend = FALSE) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  geom_text(aes(label = sprintf("%.2f", correlation), color = correlation), vjust = -0.5, size = 4, show.legend = FALSE) +
+  scale_color_gradient(low = "lightblue", high = "darkblue", guide = "none") +
+  theme_minimal() +
+  labs(x = "", y = "") +
+  theme(
+    axis.text.x = element_text(size = 12, family = "Helvetica", angle = 45, hjust = 1),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.margin = margin(t = 10, r = 20, b = 40, l = 10, unit = "pt")
+  ) +
+  scale_y_continuous(limits = c(0, 0.75))
+gls_oof_age_corr_bar
+
+ggsave(output_plot_age_bar_svg, gls_oof_age_corr_bar, device = "svg", width = 5.5, height = 4.5)
+ggsave(output_plot_age_bar_pdf, gls_oof_age_corr_bar, device = "pdf", width = 5.5, height = 4.5)
+
+invisible(NULL)
+```
+
+## GLS OOF Mortality Performance
+
+Summary of out-of-fold performance by clock (concordance and age correlation; means across sex). Concordance and age-correlation plots are shown above in Results Export.
+
+```{r gls-oof-performance}
+oof_summary <- oof_metrics_long |>
+  group_by(clock, .metric) |>
+  summarise(.estimate = mean(.estimate, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+knitr::kable(as.data.frame(oof_summary),
+             caption = "GLS OOF Mortality Model Performance (mean across sex)",
+             digits = 4)
+```
+
+## GLS Scaling Information Analysis
+
+```{r gls-scaling-info}
+# OOF scaling info (written by export-results chunk)
+# Set to the same path used for `output_scaling_info_file` above.
+output_scaling_info_file <- "PATH/TO/output_scaling_info.csv"
+gls_mortality_scaling_info <- read_csv(
+  output_scaling_info_file,
+  show_col_types = FALSE
+)
+
+knitr::kable(
+  as.data.frame(gls_mortality_scaling_info |> 
+    select(clock, sd_in_original_units, interpretation, mean_gap, median_gap, q25_gap, q75_gap)),
+  caption = "Scaling Information for GLS Mortality Models - What 1 SD Represents in Mortality Units",
+  digits = 3
+)
+
+ggplot(gls_mortality_scaling_info, aes(x = reorder(clock, sd_in_original_units), y = sd_in_original_units)) +
+  geom_bar(stat = "identity", fill = "darkred", alpha = 0.7) +
+  coord_flip() +
+  labs(title = "Standard Deviation of Mortality Scores by GLS Organ Clock",
+       subtitle = "What 1 SD represents in mortality units",
+       x = "Organ Clock", y = "Standard Deviation (mortality units)") +
+  theme_minimal() +
+  geom_text(aes(label = sprintf("%.2f", sd_in_original_units)), hjust = -0.2, size = 3) +
+  theme(plot.title = element_text(hjust = 0.5))
+```

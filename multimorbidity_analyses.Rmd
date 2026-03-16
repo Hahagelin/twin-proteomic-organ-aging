@@ -1,0 +1,2947 @@
+---
+title: "Multimorbidity Analysis"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(survival)
+library(survminer)
+library(broom)
+library(haven)
+library(readxl)
+library(ggvenn)
+library(patchwork)
+library(lubridate)
+library(lmtest)
+library(sandwich)
+library(ggrepel)
+select = dplyr::select
+rename = dplyr::rename
+slice = dplyr::slice
+```
+
+```{r config}
+# Input files (set these for your environment)
+input_diagnosis_file <- "PATH/TO/input_diagnosis.csv"
+input_cancer_file <- "PATH/TO/input_cancer.csv"
+input_metadata_file <- "PATH/TO/input_metadata.csv"
+input_timeline_file <- "PATH/TO/input_diagnosis_timeline.csv"
+input_organ_age_file <- "PATH/TO/input_organ_age.csv"
+input_extreme_organ_file <- "PATH/TO/input_extreme_organ_quantiles.csv"
+
+# Output root (set this for your environment)
+output_multimorbidity_core_dir <- "PATH/TO/output/core_multimorbidity"
+
+# Core schema configuration
+id_col <- "twin_id"
+pair_col <- "pair_id"
+sex_col <- "sex"
+male_code <- 1
+female_code <- 2
+
+# Covariate sets (choose active set)
+covariate_sets <- list(
+  minimal = c("age", "sex"),
+  cardiometabolic = c("age", "sex", "bmi"),
+  extended = c("age", "sex", "edyrs", "eversmok", "bmi", "hba1c", "total_hdl_ratio", "crp")
+)
+active_covariate_set <- "extended"
+active_covariates <- covariate_sets[[active_covariate_set]]
+if (is.null(active_covariates)) stop("Invalid `active_covariate_set` in config.")
+covariate_formula_terms <- paste(active_covariates, collapse = " + ")
+covariate_formula_terms_nosex <- paste(setdiff(active_covariates, "sex"), collapse = " + ")
+```
+
+# Data Loading
+
+```{r}
+composite_diseases <- read_csv(input_diagnosis_file)
+cancer <- read_csv(input_cancer_file)
+twins <- read_csv(input_metadata_file)
+timeline <- read_csv(input_timeline_file) |>
+  filter(twin_id %in% twins$twin_id) |> 
+  left_join(twins |> 
+              select(age, twin_id),
+            by = "twin_id")
+
+# Ensure has_disease column exists (all rows in timeline represent diseases)
+if (!"has_disease" %in% names(timeline)) {
+  timeline <- timeline |>
+    mutate(has_disease = 1)
+}
+
+organ_age_mortality <- read_csv(input_organ_age_file)
+```
+
+# Negative Binomial Models
+
+```{r}
+# Disease grouping definitions
+
+cvd_multimorbidity <- c(
+  "Other cardiovascular diseases",
+  "Heart failure",
+  "Atrial fibrillation",
+  "Hypertension",
+  "Ischemic heart disease",
+  "Cerebrovascular diseases",
+  "Peripheral vascular disease"
+)
+
+neuropsychiatric_multimorbidity <- c(
+  "Depression",
+  "Dementia",
+  "Schizophrenia and delusional diseases",
+  "Other psychiatric and behavioral diseases"
+)
+
+digestive_multimorbidity <- c(
+  "Colitis and related diseases",
+  "Chronic liver diseases",
+  "Chronic pancreas, biliary tract and gallbladder diseases",
+  "Esophagus, stomach and duodenum diseases",
+  "Other digestive diseases",
+  "Inflammatory bowel disease"
+)
+
+endocrine_multimorbidity <- c(
+  "Thyroid diseases",
+  "Diabetes"
+)
+
+malignancy_multimorbidity <- c(
+  "Solid neoplasms",
+  "Hematological neoplasms"
+)
+
+musculoskeletal_multimorbidity <- c(
+  "Osteoporosis",
+  "Osteoarthrisis",
+  "Inflammatory arthropathies",
+  "Other musculoskeletal joint diseases"
+)
+
+neurosensorial_multimorbidity <- c(
+  "Deafness, Hearing impairment",
+  "Other eye diseases",
+  "Glaucoma",
+  "Migraine and facial pain syndromes",
+  "Peripheral neuropathy",
+  "Parkinson and Parkinsonism",
+  "Epilepsy",
+  "Multiple sclerosis"
+)
+
+respiratory_multimorbidity <- c(
+  "COPD, Emphysema, Chronic bronchitis",
+  "Other respiratory diseases",
+  "Asthma"
+)
+
+urological_multimorbidity <- c(
+  "Chronic kidney diseases",
+  "Prostate diseases",
+  "Other genitourinary diseases"
+)
+
+```
+
+```{r}
+# Build prevalent counts per expanded grouping from `timeline`
+
+# Collect grouping vectors that actually exist
+group_names_all <- c(
+  "cvd_multimorbidity",
+  "neuropsychiatric_multimorbidity",
+  "digestive_multimorbidity",
+  "endocrine_multimorbidity",
+  "malignancy_multimorbidity",
+  "musculoskeletal_multimorbidity",
+  "neurosensorial_multimorbidity",
+  "respiratory_multimorbidity",
+  "urological_multimorbidity"
+)
+
+group_vectors <- mget(group_names_all, ifnotfound = as.list(rep(list(NULL), length(group_names_all)))) |>
+  Filter(f = function(x) !is.null(x) && length(x) > 0)
+
+# Detect the timeline column that holds disease labels matching our group vectors
+group_label_values <- unique(unlist(group_vectors, use.names = FALSE))
+
+# Try explicit column names first
+possible_label_cols <- c("Chronic disease", "Chronic Disease", "chronic_disease", "disease", "Disease")
+label_col <- NULL
+for (col in possible_label_cols) {
+  if (col %in% names(timeline)) {
+    # Check if this column has matching values
+    vals <- unique(timeline[[col]])
+    if (sum(vals %in% group_label_values, na.rm = TRUE) > 0) {
+      label_col <- col
+      break
+    }
+  }
+}
+
+# If explicit names didn't work, try auto-detection
+if (is.null(label_col)) {
+  candidate_label_cols <- names(timeline)[vapply(timeline, inherits, logical(1), what = "character")]
+  
+  detect_label_col <- function(df, candidates, targets) {
+    if (length(candidates) == 0L) return(NA_character_)
+    overlaps <- vapply(candidates, function(col) {
+      vals <- unique(df[[col]])
+      sum(vals %in% targets, na.rm = TRUE)
+    }, numeric(1))
+    if (max(overlaps, na.rm = TRUE) == 0) return(NA_character_)
+    candidates[which.max(overlaps)]
+  }
+  
+  label_col <- detect_label_col(timeline, candidate_label_cols, group_label_values)
+}
+
+# Error handling if label column not found
+if (is.null(label_col) || is.na(label_col)) {
+  stop("Could not find disease label column in timeline. Expected columns: ", 
+       paste(possible_label_cols, collapse = ", "), 
+       ". Available columns: ", paste(names(timeline), collapse = ", "))
+}
+
+# Restrict to baseline-prevalent records; prefer explicit `prevalent` flag if available
+timeline_base <- timeline |>
+  dplyr::mutate(.is_prevalent = dplyr::case_when(
+    "prevalent" %in% names(timeline) ~ prevalent == 1,
+    TRUE ~ earliest_date <= checkdate
+  )) |>
+  dplyr::filter(.is_prevalent)
+
+# Filter by label column using safe extraction
+if (label_col %in% names(timeline_base)) {
+  timeline_base <- timeline_base |>
+    dplyr::filter(!is.na(.data[[label_col]]))
+} else {
+  stop("Label column '", label_col, "' not found in timeline_base. Available columns: ", 
+       paste(names(timeline_base), collapse = ", "))
+}
+
+# Helper to compute counts for a single grouping vector
+count_group <- function(df, label_column, labels, new_name) {
+  df |>
+    dplyr::filter(.data[[label_column]] %in% labels) |>
+    dplyr::distinct(twin_id, .data[[label_column]]) |>
+    dplyr::count(twin_id, name = new_name)
+}
+
+# Compute counts for all available groupings and combine
+mm_counts_list <- lapply(names(group_vectors), function(nm) {
+  count_group(timeline_base, label_col, group_vectors[[nm]], nm)
+})
+
+mm_counts <- purrr::reduce(mm_counts_list, ~dplyr::full_join(.x, .y, by = "twin_id")) |>
+  dplyr::mutate(dplyr::across(-twin_id, ~dplyr::coalesce(.x, 0L)))
+
+# Ensure the full cohort (including individuals with zero diagnoses) is present
+mm_counts_full <- twins |>
+  dplyr::select(twin_id) |>
+  dplyr::left_join(mm_counts, by = "twin_id") |>
+  dplyr::mutate(dplyr::across(-twin_id, ~dplyr::coalesce(.x, 0L)))
+```
+
+```{r}
+# Ensure required objects exist
+if (!exists("composite_diseases")) {
+  composite_diseases <- readr::read_csv(input_diagnosis_file)
+}
+if (!exists("organ_age_mortality")) {
+  organ_age_mortality <- readr::read_csv(input_organ_age_file)
+}
+
+org_clean <- organ_age_mortality |> janitor::clean_names()
+
+# Define all disease groupings to analyze based on available vectors
+label_map <- c(
+  cvd_multimorbidity = "Cardiovascular",
+  neuropsychiatric_multimorbidity = "Neuropsychiatric",
+  digestive_multimorbidity = "Digestive",
+  endocrine_multimorbidity = "Endocrine",
+  malignancy_multimorbidity = "Malignancy",
+  musculoskeletal_multimorbidity = "Musculoskeletal",
+  neurosensorial_multimorbidity = "Neurosensorial",
+  respiratory_multimorbidity = "Respiratory",
+  urological_multimorbidity = "Urological"
+)
+
+available_group_names <- names(group_vectors)
+disease_groupings <- as.list(unname(label_map[available_group_names]))
+names(disease_groupings) <- available_group_names
+
+# Get organ age predictors for univariate models (include all organs)
+predictors_uni <- org_clean |>
+  dplyr::select(-twin_id) |>
+  names()
+
+# Get organ age predictors for multivariate models (excluding ovary and prostate)
+predictors_mv <- org_clean |>
+  dplyr::select(-twin_id) |>
+  names() |>
+  (
+    function(nms) nms[!grepl("ovary|prostate", nms, ignore.case = TRUE)]
+  )()
+
+# Define consistent outcome order for all heatmaps
+outcome_order_standard <- c(
+  "Cardiovascular",
+  "Neuropsychiatric", 
+  "Digestive",
+  "Endocrine",
+  "Malignancy",
+  "Musculoskeletal",
+  "Neurosensorial",
+  "Respiratory",
+  "Urological"
+)
+
+# NB model with cluster-robust standard errors
+fit_nb_uni <- function(data, outcome, predictor) {
+  # Handle sex-specific organs
+  if (grepl("ovary", predictor, ignore.case = TRUE)) {
+    # Filter to females
+    data <- data |> dplyr::filter(sex == 2, !is.na(!!rlang::sym(predictor)))
+  } else if (grepl("prostate", predictor, ignore.case = TRUE)) {
+    # Filter to males
+    data <- data |> dplyr::filter(sex == 1, !is.na(!!rlang::sym(predictor)))
+  } else {
+    # Remove missing values for this organ
+    data <- data |> dplyr::filter(!is.na(!!rlang::sym(predictor)))
+  }
+  
+  # Check for sufficient data and variation
+  if (nrow(data) < 10) {
+    return(tibble::tibble(
+      outcome = outcome,
+      organ_age = predictor,
+      irr = NA_real_,
+      ci_low = NA_real_,
+      ci_high = NA_real_,
+      p_value = NA_real_,
+      aic = NA_real_,
+      n = nrow(data)
+    ))
+  }
+  
+  # For sex-specific organs, don't include sex as a covariate
+  if (grepl("ovary|prostate", predictor, ignore.case = TRUE)) {
+    fml <- stats::as.formula(paste(outcome, "~", predictor, "+", covariate_formula_terms_nosex))
+  } else {
+    # Check if sex has sufficient variation for non-sex-specific organs
+    if (length(unique(data$sex)) < 2) {
+      return(tibble::tibble(
+        outcome = outcome,
+        organ_age = predictor,
+        irr = NA_real_,
+        ci_low = NA_real_,
+        ci_high = NA_real_,
+        p_value = NA_real_,
+        aic = NA_real_,
+        n = nrow(data)
+      ))
+    }
+    fml <- stats::as.formula(paste(outcome, "~", predictor, "+", covariate_formula_terms))
+  }
+  
+  # Fit model with error handling
+  mdl <- tryCatch({
+    MASS::glm.nb(fml, data = data)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(mdl)) {
+    return(tibble::tibble(
+      outcome = outcome,
+      organ_age = predictor,
+      irr = NA_real_,
+      ci_low = NA_real_,
+      ci_high = NA_real_,
+      p_value = NA_real_,
+      aic = NA_real_,
+      n = nrow(data)
+    ))
+  }
+  
+  # Try cluster-robust SE by pair_id if present
+  vc <- tryCatch(sandwich::vcovCL(mdl, cluster = data$pair_id), error = function(e) NULL)
+  if (!is.null(vc)) {
+    ct <- tryCatch(lmtest::coeftest(mdl, vcov. = vc), error = function(e) NULL)
+    if (!is.null(ct) && predictor %in% rownames(ct)) {
+      est <- ct[predictor, "Estimate"]
+      se <- ct[predictor, "Std. Error"]
+      pval <- ct[predictor, "Pr(>|z|)"]
+    } else {
+      est <- NA_real_; se <- NA_real_; pval <- NA_real_
+    }
+  } else {
+    sm <- tryCatch(summary(mdl)$coefficients, error = function(e) NULL)
+    if (!is.null(sm) && predictor %in% rownames(sm)) {
+      est <- sm[predictor, "Estimate"]; se <- sm[predictor, "Std. Error"]; pval <- sm[predictor, "Pr(>|z|)"]
+    } else {
+      est <- NA_real_; se <- NA_real_; pval <- NA_real_
+    }
+  }
+  
+  tibble::tibble(
+    outcome = outcome,
+    organ_age = predictor,
+    irr = exp(est),
+    ci_low = exp(est - 1.96 * se),
+    ci_high = exp(est + 1.96 * se),
+    p_value = pval,
+    aic = stats::AIC(mdl),
+    n = stats::nobs(mdl)
+  )
+}
+
+# Loop through all disease groupings
+nb_all_results <- purrr::map_dfr(names(disease_groupings), function(outcome_var) {
+  # Create dataset for this outcome
+  df_outcome <- twins |>
+    dplyr::select(twin_id, pair_id, age, sex, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp) |>
+    dplyr::left_join(mm_counts_full |> dplyr::select(twin_id, !!outcome_var), by = "twin_id") |>
+    dplyr::mutate(
+      !!outcome_var := dplyr::coalesce(!!rlang::sym(outcome_var), 0L),
+      sex = as.factor(sex)
+    ) |>
+    dplyr::left_join(org_clean, by = "twin_id")
+  
+  # Fit models for all predictors
+  purrr::map_dfr(predictors_uni, ~fit_nb_uni(df_outcome, outcome_var, .x))
+})
+
+# Format results
+nb_all_results <- nb_all_results |>
+  dplyr::arrange(outcome, aic) |>
+  dplyr::group_by(outcome) |>
+  dplyr::mutate(
+    irr = round(irr, 3),
+    ci_low = round(ci_low, 3),
+    ci_high = round(ci_high, 3),
+    aic = round(aic, 1),
+    p_value = signif(p_value, 3),
+    fdr = p.adjust(p_value, method = "fdr")
+  ) |>
+  dplyr::ungroup()
+```
+
+# Overall Burden vs Organ Aging
+
+```{r}
+# Prepare data for overall multimorbidity burden plot
+# Join multimorbidity counts with organ ages
+burden_data <- mm_counts_full |>
+  dplyr::left_join(org_clean, by = "twin_id")
+
+# Calculate total baseline multimorbidity count (sum across all disease groupings)
+disease_group_cols <- names(mm_counts_full)[names(mm_counts_full) != "twin_id"]
+burden_data <- burden_data |>
+  dplyr::mutate(
+    total_mm_count = rowSums(dplyr::across(dplyr::all_of(disease_group_cols)), na.rm = TRUE)
+  )
+
+# Calculate mean standardized organ age per individual
+# Exclude sex-specific organs (Ovary, Prostate) for overall mean
+organ_cols <- org_clean |>
+  dplyr::select(-twin_id) |>
+  names()
+organ_cols_exclude_sex <- organ_cols[!grepl("ovary|prostate", organ_cols, ignore.case = TRUE)]
+
+burden_data <- burden_data |>
+  dplyr::rowwise() |>
+  dplyr::mutate(
+    mean_organ_age = mean(dplyr::c_across(dplyr::all_of(organ_cols_exclude_sex)), na.rm = TRUE)
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::filter(!is.na(mean_organ_age), is.finite(mean_organ_age))
+
+# Categorize total multimorbidity count into bins
+burden_data <- burden_data |>
+  dplyr::mutate(
+    mm_count_cat = dplyr::case_when(
+      total_mm_count == 0 ~ "0",
+      total_mm_count == 1 ~ "1",
+      total_mm_count == 2 ~ "2",
+      total_mm_count == 3 ~ "3",
+      total_mm_count == 4 ~ "4",
+      total_mm_count >= 5 ~ "≥5",
+      TRUE ~ NA_character_
+    ),
+    mm_count_cat = factor(mm_count_cat, levels = c("0", "1", "2", "3", "4", "≥5"))
+  )
+
+# Calculate summary statistics by multimorbidity count category
+burden_summary <- burden_data |>
+  dplyr::group_by(mm_count_cat) |>
+  dplyr::summarise(
+    n = dplyr::n(),
+    mean_organ_age = mean(mean_organ_age, na.rm = TRUE),
+    se_organ_age = sd(mean_organ_age, na.rm = TRUE) / sqrt(n),
+    ci_low = mean_organ_age - 1.96 * se_organ_age,
+    ci_high = mean_organ_age + 1.96 * se_organ_age,
+    .groups = "drop"
+  ) |>
+  dplyr::filter(!is.na(mm_count_cat))
+
+# Create publication plot
+burden_plot <- burden_summary |>
+  ggplot2::ggplot(ggplot2::aes(x = mm_count_cat, y = mean_organ_age)) +
+  # Reference line at y=0 (very light grey)
+  ggplot2::geom_hline(yintercept = 0, color = "grey85", linewidth = 0.3, linetype = "solid") +
+  # Bars: desaturated blue, narrower with more spacing
+  ggplot2::geom_col(fill = "#6B8FA3", alpha = 0.85, width = 0.45) +
+  # Error bars: light grey, thin, no caps
+  ggplot2::geom_errorbar(
+    ggplot2::aes(ymin = ci_low, ymax = ci_high),
+    width = 0.15,
+    linewidth = 0.4,
+    color = "grey50"
+  ) +
+  # Add sample size labels below x-axis labels
+  ggplot2::geom_text(
+    data = burden_summary,
+    ggplot2::aes(x = mm_count_cat, y = -Inf, label = paste0("(n=", n, ")")),
+    vjust = 2.5,
+    size = 3.2,
+    color = "grey50",
+    inherit.aes = FALSE
+  ) +
+  ggplot2::labs(
+    x = "Baseline multimorbidity count",
+    y = "Mean organ age"
+  ) +
+  ggplot2::theme_minimal(base_size = 14) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.major.y = ggplot2::element_line(color = "grey95", linewidth = 0.3),
+    legend.position = "none",
+    axis.title = ggplot2::element_text(size = 14, face = "plain"),
+    axis.text.x = ggplot2::element_text(size = 12, color = "black", hjust = 0.5),
+    axis.text.y = ggplot2::element_text(size = 12, color = "black"),
+    plot.margin = ggplot2::margin(b = 25, unit = "pt")
+  )
+
+print(burden_plot)
+
+# Save figure
+dir.create(file.path(output_multimorbidity_core_dir, "other"), 
+           recursive = TRUE, showWarnings = FALSE)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       "overall_mm_burden_organ_aging.pdf"),
+  plot = burden_plot,
+  width = 6,
+  height = 4,
+  dpi = 300
+)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       "overall_mm_burden_organ_aging.png"),
+  plot = burden_plot,
+  width = 6,
+  height = 4,
+  dpi = 300
+)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       "overall_mm_burden_organ_aging.svg"),
+  plot = burden_plot,
+  width = 6,
+  height = 4
+)
+```
+
+```{r}
+# Panel C: Trend plot - dose-response relationship
+# Convert categorical to numeric ordinal for smooth trend fitting
+burden_summary_numeric <- burden_summary |>
+  dplyr::mutate(
+    mm_count_numeric = dplyr::case_when(
+      mm_count_cat == "0" ~ 0,
+      mm_count_cat == "1" ~ 1,
+      mm_count_cat == "2" ~ 2,
+      mm_count_cat == "3" ~ 3,
+      mm_count_cat == "4" ~ 4,
+      mm_count_cat == "≥5" ~ 5,
+      TRUE ~ NA_real_
+    )
+  ) |>
+  dplyr::filter(!is.na(mm_count_numeric))
+
+# Create Panel C trend plot
+burden_trend_plot <- burden_summary_numeric |>
+  ggplot2::ggplot(ggplot2::aes(x = mm_count_numeric, y = mean_organ_age)) +
+  # Reference line at y=0 (thin, neutral grey)
+  ggplot2::geom_hline(yintercept = 0, color = "grey75", linewidth = 0.25, linetype = "solid") +
+  # Lollipop stems from 0 to mean (light grey)
+  ggplot2::geom_segment(
+    ggplot2::aes(x = mm_count_numeric, xend = mm_count_numeric, y = 0, yend = mean_organ_age),
+    color = "grey40",
+    linewidth = 0.5,
+    alpha = 0.6
+  ) +
+  # Points for mean organ age per category (gradient: darker as organ age increases)
+  ggplot2::geom_point(
+    ggplot2::aes(color = mean_organ_age),
+    size = 4.5,
+    alpha = 1
+  ) +
+  # Sample size labels below x-axis
+  ggplot2::geom_text(
+    data = burden_summary_numeric,
+    ggplot2::aes(x = mm_count_numeric, y = -Inf, label = paste0("(n=", n, ")")),
+    vjust = 2.5,
+    size = 3.2,
+    color = "grey50",
+    inherit.aes = FALSE
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = 0:5,
+    labels = c("0", "1", "2", "3", "4", "5+")
+  ) +
+  ggplot2::scale_color_gradient(
+    low = "#6BA3D1",
+    high = "#2166AC",
+    guide = "none"
+  ) +
+  ggplot2::labs(
+    x = "Baseline multimorbidity count",
+    y = "Mean organ age"
+  ) +
+  ggplot2::theme_minimal(base_size = 14) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.major.y = ggplot2::element_blank(),
+    legend.position = "none",
+    axis.title = ggplot2::element_text(size = 14, face = "plain"),
+    axis.text.x = ggplot2::element_text(size = 12, color = "black", hjust = 0.5),
+    axis.text.y = ggplot2::element_text(size = 12, color = "black"),
+    plot.margin = ggplot2::margin(t = 15, r = 15, b = 30, l = 15, unit = "pt")
+  )
+
+print(burden_trend_plot)
+
+c_width <- 4
+
+# Save figure
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       "overall_mm_burden_organ_aging_trend.pdf"),
+  plot = burden_trend_plot,
+  width = c_width,
+  height = 4,
+  dpi = 300
+)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       "overall_mm_burden_organ_aging_trend.png"),
+  plot = burden_trend_plot,
+  width = c_width,
+  height = 4,
+  dpi = 300
+)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       "overall_mm_burden_organ_aging_trend.svg"),
+  plot = burden_trend_plot,
+  width = c_width,
+  height = 4
+)
+```
+
+```{r}
+# Summary of results by disease grouping
+nb_summary <- nb_all_results |>
+  dplyr::group_by(outcome) |>
+  dplyr::summarise(
+    n_models = n(),
+    min_aic = min(aic, na.rm = TRUE),
+    max_aic = max(aic, na.rm = TRUE),
+    significant_models = sum(p_value < 0.05, na.rm = TRUE),
+    fdr_significant = sum(fdr < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    outcome_clean = disease_groupings[outcome] |> unlist()
+  )
+
+# Summary
+nb_summary |>
+  dplyr::select(outcome_clean, n_models, significant_models, fdr_significant) |>
+  kableExtra::kable(col.names = c("Disease Group", "Models", "Significant (p<0.05)", "FDR Significant")) |>
+  kableExtra::kable_styling()
+```
+
+```{r}
+# Control variables for heatmap appearance
+HEATMAP_TEXT_SIZE <- 14
+HEATMAP_SQUARE_SIZE_DIVISOR <- 12
+
+# Prepare data for heatmap with all disease groupings
+heatmap_df <- nb_all_results |>
+  dplyr::mutate(
+    outcome_clean = disease_groupings[outcome] |> unlist(),
+    organ_age_clean = stringr::str_replace_all(organ_age, "_", " ") |> stringr::str_to_title(),
+    effect_size = irr,
+    significance = dplyr::case_when(
+      is.na(fdr) ~ "",
+      fdr < 0.001 ~ "***",
+      fdr < 0.01 ~ "**",
+      fdr < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    effect_size_colored = dplyr::if_else(significance != "", effect_size, NA_real_),
+    non_sig_marker = dplyr::if_else(significance == "", "×", "")
+  ) |>
+  dplyr::select(outcome_clean, organ_age_clean, effect_size, effect_size_colored, significance, non_sig_marker) |>
+  dplyr::filter(!is.na(effect_size))
+
+# Create consistent organ order
+preferred_order <- c(
+  "Brain", "Heart", "Kidney And Bladder", "Liver", "Lung",
+  "Muscle", "Pancreas", "Gastrointestinal Tract", "Ovary", "Prostate"
+)
+
+all_organs <- unique(heatmap_df$organ_age_clean)
+available_preferred <- intersect(preferred_order, all_organs)
+other_organs <- setdiff(all_organs, preferred_order)
+static_organ_order <- c(available_preferred, other_organs)
+
+# Use standard outcome order for consistency
+plot_df <- heatmap_df |>
+  dplyr::mutate(
+    outcome_clean = factor(outcome_clean, levels = outcome_order_standard),
+    organ_age_clean = factor(organ_age_clean, levels = static_organ_order)
+  )
+
+if (length(unique(plot_df$outcome_clean)) == 0 || length(unique(plot_df$organ_age_clean)) == 0) {
+  heatmap_plot <- NULL
+} else {
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  # Calculate dynamic range (white-to-red only, no negative values)
+  # Use effect_size (all values) not effect_size_colored (only significant) to capture full range
+  effect_range <- range(log(plot_df$effect_size), na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  # Prepare data with numeric coordinates
+  plot_df <- plot_df |>
+    dplyr::mutate(
+      outcome_num = (as.numeric(outcome_clean) - 1) * square_size + square_size/2,
+      organ_num = (as.numeric(organ_age_clean) - 1) * square_size + square_size/2
+    )
+  
+  outcome_order <- levels(plot_df$outcome_clean)
+  organ_order <- levels(plot_df$organ_age_clean)
+  
+  # Heatmap: use IRR for color; only significant cells get color, non-significant get an "×" on white
+  heatmap_plot <- ggplot2::ggplot(plot_df, ggplot2::aes(x = organ_num, y = outcome_num, fill = log(effect_size_colored))) +
+    ggplot2::geom_tile(width = square_size, height = square_size, color = NA) +
+    ggplot2::geom_text(ggplot2::aes(x = organ_num, y = outcome_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    ggplot2::scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(0, max_limit * 0.5, max_limit)),
+      limits = c(0, max_limit),
+      na.value = "white",
+      name = "log(IRR)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = (seq_along(organ_order) - 1) * square_size + square_size/2,
+      labels = organ_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(organ_order) * square_size + square_size/2)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = (seq_along(outcome_order) - 1) * square_size + square_size/2,
+      labels = outcome_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(outcome_order) * square_size + square_size/2)
+    ) +
+    ggplot2::theme_minimal(base_family = "Helvetica") +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = "Helvetica", color = "black"),
+      plot.title = ggplot2::element_text(size = 16, face = "bold"),
+      plot.subtitle = ggplot2::element_text(size = 12),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = ggplot2::element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = ggplot2::margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      legend.position = "right",
+      legend.title = ggplot2::element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = ggplot2::element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = grid::unit(0.8, "cm"),
+      legend.key.width = grid::unit(0.5, "cm"),
+      panel.grid = ggplot2::element_blank(),
+      panel.spacing = grid::unit(0, "lines"),
+      panel.border = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    ggplot2::coord_fixed(ratio = 1, expand = FALSE)
+}
+
+print(heatmap_plot)
+
+# Save heatmap
+dir.create(file.path(output_multimorbidity_core_dir, "nb", "main"), recursive = TRUE, showWarnings = FALSE)
+if (!is.null(heatmap_plot)) {
+  ggplot2::ggsave(
+    filename = file.path(output_multimorbidity_core_dir, "nb", "main", "nb_full_main_irr_heatmap.svg"),
+    plot = heatmap_plot,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+```
+
+## Forest tables (helpers)
+```{r nb_ag_forest_helpers}
+make_bw_forest_table <- function(df, organ_col, eff_col, low_col, high_col, fdr_col, title, main_color = "black", x_upper_cap = 3, axis_label = "Hazard Ratio (95% CI)") {
+  d <- df |>
+    dplyr::mutate(
+      hr = .data[[eff_col]],
+      hr_lower = .data[[low_col]],
+      hr_upper = .data[[high_col]],
+      fdr = .data[[fdr_col]],
+      significant = fdr < 0.05,
+      errorbar_color = if_else(fdr < 0.05, "grey30", "gray80"),
+      Organ_Display = .data[[organ_col]]
+    ) |>
+    dplyr::filter(is.finite(hr), is.finite(hr_lower), is.finite(hr_upper)) |>
+    dplyr::arrange(dplyr::desc(hr)) |>
+    dplyr::mutate(y_pos = rev(dplyr::row_number()), Organ_Display = factor(Organ_Display, levels = Organ_Display))
+
+  if (nrow(d) == 0) return(NULL)
+
+  # Dynamic x-axis limits with hard caps
+  base_min <- 0.25
+  base_max <- 3
+  hard_min <- 0.05
+  hard_max <- 10
+  
+  x_min <- suppressWarnings(min(d$hr_lower, na.rm = TRUE))
+  x_max <- suppressWarnings(max(d$hr_upper, na.rm = TRUE))
+  
+  if (!is.finite(x_min)) x_min <- base_min
+  if (!is.finite(x_max)) x_max <- base_max
+  
+  x_min <- max(x_min, 0.001)
+  
+  lower_margin_factor <- 0.9
+  upper_margin_factor <- 1.1
+  
+  x_min <- min(base_min, x_min * lower_margin_factor)
+  x_max <- max(base_max, x_max * upper_margin_factor)
+  
+  x_min <- max(hard_min, x_min)
+  x_max <- min(hard_max, x_max)
+  
+  x_breaks <- pretty(c(x_min, x_max), n = 6)
+  x_breaks <- x_breaks[x_breaks >= x_min & x_breaks <= x_max]
+  
+  # Add scientific notation formatting
+  d <- d |>
+    dplyr::mutate(
+      use_sci = pmax(abs(hr), abs(hr_lower), abs(hr_upper), na.rm = TRUE) >= 10,
+      use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+      hr_formatted = if_else(
+        use_sci,
+        sprintf("%.1e (%.1e-%.1e)", hr, hr_lower, hr_upper),
+        sprintf("%.2f (%.2f-%.2f)", hr, hr_lower, hr_upper)
+      )
+    )
+  
+  # Detect if we need wider table for scientific notation
+  has_sci_notation <- any(d$use_sci, na.rm = TRUE)
+  table_width_ratio <- if (has_sci_notation) 3.2 else 2.5
+  
+  # Create table data
+  tab <- d |>
+    dplyr::transmute(y_pos, `Organ age` = Organ_Display, `Effect (95% CI)` = hr_formatted, `FDR` = sprintf("%.2e", fdr))
+
+  x_pos <- tibble::tibble(col = c("Organ age", "Effect (95% CI)", "FDR"), x = c(1.0, 4.0, 7.5))
+  table_long <- tab |>
+    tidyr::pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    dplyr::left_join(x_pos, by = "col")
+
+  p_table <- ggplot2::ggplot(table_long, ggplot2::aes(x = x, y = y_pos, label = val)) +
+    ggplot2::geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3) +
+    ggplot2::geom_text(data = x_pos |> dplyr::mutate(y_pos = max(d$y_pos) + 1), ggplot2::aes(x = x, y = y_pos, label = col), hjust = c(0, 0, 1), fontface = "bold", inherit.aes = FALSE, size = 3.3) +
+    ggplot2::scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.5, max(d$y_pos) + 1.5)) +
+    ggplot2::scale_x_continuous(limits = c(0.5, 9.0), expand = c(0, 0)) +
+    ggplot2::labs(title = title) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.1, size = 12), axis.title = ggplot2::element_blank(), axis.text.x = ggplot2::element_blank(), axis.ticks = ggplot2::element_blank(), panel.grid = ggplot2::element_blank(), plot.margin = grid::unit(c(12, 6, 6, 6), "pt"))
+
+  # Determine which points are out of bounds and cap CIs to plot range
+  d <- d |>
+    dplyr::mutate(
+      out_of_bounds_point = hr < x_min | hr > x_max,
+      hr_lower_capped = pmax(hr_lower, x_min),
+      hr_upper_capped = pmin(hr_upper, x_max),
+      has_any_value_outside = (hr < x_min | hr > x_max | hr_lower < x_min | hr_upper > x_max)
+    )
+  
+  # Only plot data where the effect size itself is within bounds
+  data_in_bounds <- d |> dplyr::filter(!out_of_bounds_point)
+  
+  # Calculate legend positions
+  legend_y <- max(d$y_pos) + 1.5
+  legend_left_x <- x_min + (x_max - x_min) * 0.03
+  legend_right_x <- x_min + (x_max - x_min) * 0.60
+  legend_bottom_y <- 0.25
+  legend_bottom_x <- x_min + (x_max - x_min) * 0.60
+
+  p_forest <- ggplot2::ggplot(d, ggplot2::aes(y = y_pos)) +
+    ggplot2::geom_rect(ggplot2::aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, fill = factor(seq_along(Organ_Display) %% 2)), alpha = 0.6, show.legend = FALSE) +
+    ggplot2::scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    ggplot2::geom_segment(ggplot2::aes(x = 1, xend = 1, y = 0.5, yend = max(d$y_pos) + 0.75), linetype = "33", color = "grey10", linewidth = 0.7) +
+    {if (nrow(data_in_bounds) > 0) ggplot2::geom_errorbarh(data = data_in_bounds, ggplot2::aes(xmin = hr_lower_capped, xmax = hr_upper_capped), color = data_in_bounds$errorbar_color, height = 0.15, linewidth = 0.6)} +
+    {if (nrow(data_in_bounds) > 0) ggplot2::geom_point(data = data_in_bounds, ggplot2::aes(x = hr, color = significant), size = 2.5, shape = 16)} +
+    {if (nrow(data_in_bounds |> dplyr::filter(has_any_value_outside)) > 0) ggplot2::geom_text(data = data_in_bounds |> dplyr::filter(has_any_value_outside), ggplot2::aes(x = hr, y = y_pos + 0.25), label = "*", size = 3.5, color = "black")} +
+    ggplot2::annotate("text", x = legend_left_x, y = legend_y, label = "● Significant (FDR < 0.05)", hjust = 0, size = 2.6, color = main_color) +
+    ggplot2::annotate("text", x = legend_right_x, y = legend_y, label = "● Non-significant", hjust = 0, size = 2.6, color = "gray80") +
+    {if (nrow(data_in_bounds |> dplyr::filter(has_any_value_outside)) > 0) ggplot2::annotate("text", x = legend_bottom_x, y = legend_bottom_y, label = "* Value outside plot range", hjust = 1, size = 2.4, color = "black")} +
+    ggplot2::scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    ggplot2::scale_x_continuous(
+      limits = c(x_min, x_max),
+      breaks = x_breaks,
+      labels = format(x_breaks, digits = 3, trim = TRUE)
+    ) +
+    ggplot2::scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.2, max(d$y_pos) + 1.5)) +
+    ggplot2::labs(x = axis_label, y = NULL) +
+    ggplot2::theme_minimal(base_size = 11) +
+    ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.text.x = ggplot2::element_text(size = 9), axis.title.x = ggplot2::element_text(size = 10), panel.grid.major.y = ggplot2::element_blank(), panel.grid.minor = ggplot2::element_blank(), panel.grid.major.x = ggplot2::element_blank(), plot.margin = grid::unit(c(12, 12, 6, 0), "pt"), legend.position = "none") +
+    ggplot2::coord_cartesian(clip = "off")
+
+  p_table + p_forest + patchwork::plot_layout(widths = c(table_width_ratio, 1.5))
+}
+
+clean_organ_display <- function(x) {
+  dplyr::case_when(
+    x == "Gastrointestinal_tract" ~ "Gastrointestinal",
+    x == "Kidney_urinary" ~ "Kidney and Bladder",
+    TRUE ~ stringr::str_to_title(stringr::str_replace_all(x, "_", " "))
+  )
+}
+```
+
+## Forest tables: NB main
+```{r nb_forest_tables_main}
+# NB main
+if (exists("nb_all_results") && nrow(nb_all_results) > 0) {
+  out_keys <- unique(nb_all_results$outcome)
+  dir.create(file.path(output_multimorbidity_core_dir, "nb", "main"), recursive = TRUE, showWarnings = FALSE)
+  purrr::walk(out_keys, function(ok) {
+    df <- nb_all_results |>
+      dplyr::filter(outcome == ok) |>
+      dplyr::mutate(Organ_Display = clean_organ_display(organ_age))
+    p <- make_bw_forest_table(df, organ_col = "Organ_Display", eff_col = "irr", low_col = "ci_low", high_col = "ci_high", fdr_col = "fdr", title = unname(disease_groupings[ok]), axis_label = "Incidence Rate Ratio (95% CI)")
+    if (!is.null(p)) {
+      fn <- paste0("nb_forest_", stringr::str_replace_all(tolower(unname(disease_groupings[ok])), " ", "_"), ".svg")
+      ggplot2::ggsave(filename = fn, plot = p, path = file.path(output_multimorbidity_core_dir, "nb", "main"), device = "svg", width = 7, height = 5, dpi = 300)
+    }
+  })
+  
+  # Create CSV tables directory
+  csv_dir <- file.path(output_multimorbidity_core_dir, "nb", "main", "tables")
+  dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save table data as CSV
+  purrr::walk(out_keys, function(ok) {
+    csv_data <- nb_all_results |>
+      dplyr::filter(outcome == ok) |>
+      dplyr::mutate(
+        use_sci = pmax(abs(irr), abs(ci_low), abs(ci_high), na.rm = TRUE) >= 10,
+        use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+        irr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", irr, ci_low, ci_high),
+          sprintf("%.2f (%.2f-%.2f)", irr, ci_low, ci_high)),
+        Organ_Display = clean_organ_display(organ_age)
+      ) |>
+      dplyr::select(Organ = Organ_Display, `Effect (95% CI)` = irr_formatted, FDR = fdr)
+    
+    if (nrow(csv_data) > 0) {
+      fn <- paste0("nb_", stringr::str_replace_all(tolower(unname(disease_groupings[ok])), " ", "_"), ".csv")
+      write.csv(csv_data, file = file.path(csv_dir, fn), row.names = FALSE)
+    }
+  })
+}
+```
+
+# Within-Pair Negative Binomial Models
+
+```{r}
+# Within-pair NB fitting functions
+fit_nb_uni_within <- function(data, outcome, predictor) {
+  # Handle sex-specific organs
+  if (grepl("ovary", predictor, ignore.case = TRUE)) {
+    # Filter to females
+    data <- data |> dplyr::filter(sex == 2, !is.na(!!rlang::sym(predictor)))
+  } else if (grepl("prostate", predictor, ignore.case = TRUE)) {
+    # Filter to males
+    data <- data |> dplyr::filter(sex == 1, !is.na(!!rlang::sym(predictor)))
+  } else {
+    # Remove missing values for this organ
+    data <- data |> dplyr::filter(!is.na(!!rlang::sym(predictor)))
+  }
+  
+  # skip if no within-pair variation in predictor or outcome
+  if (!("pair_id" %in% names(data))) return(tibble::tibble())
+  by_pair <- data |>
+    dplyr::group_by(pair_id) |>
+    dplyr::summarise(var_pred = stats::var(.data[[predictor]], na.rm = TRUE), var_out = stats::var(.data[[outcome]], na.rm = TRUE), .groups = "drop")
+  if (all(is.na(by_pair$var_pred)) || sum(by_pair$var_pred > 0, na.rm = TRUE) == 0) return(tibble::tibble())
+  if (all(is.na(by_pair$var_out)) || sum(by_pair$var_out > 0, na.rm = TRUE) == 0) return(tibble::tibble())
+  
+  fml <- stats::as.formula(paste(outcome, "~", predictor, "+", covariate_formula_terms_nosex))
+  mdl <- tryCatch({
+    MASS::glm.nb(fml, data = data)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(mdl)) return(tibble::tibble())
+  
+  # Try cluster-robust SE by pair_id if present
+  vc <- tryCatch(sandwich::vcovCL(mdl, cluster = data$pair_id), error = function(e) NULL)
+  if (!is.null(vc)) {
+    ct <- lmtest::coeftest(mdl, vcov. = vc)
+    if (predictor %in% rownames(ct)) {
+      est <- ct[predictor, "Estimate"]
+      se <- ct[predictor, "Std. Error"]
+      pval <- ct[predictor, "Pr(>|z|)"]
+    } else {
+      est <- NA_real_; se <- NA_real_; pval <- NA_real_
+    }
+  } else {
+    sm <- summary(mdl)$coefficients
+    if (predictor %in% rownames(sm)) {
+      est <- sm[predictor, "Estimate"]; se <- sm[predictor, "Std. Error"]; pval <- sm[predictor, "Pr(>|z|)"]
+    } else {
+      est <- NA_real_; se <- NA_real_; pval <- NA_real_
+    }
+  }
+  
+  tibble::tibble(
+    outcome = outcome,
+    organ_age = predictor,
+    irr = exp(est),
+    ci_low = exp(est - 1.96 * se),
+    ci_high = exp(est + 1.96 * se),
+    p_value = pval,
+    aic = stats::AIC(mdl),
+    n = stats::nobs(mdl)
+  )
+}
+
+# Run within-pair NB univariate and multivariate for all groupings
+nb_wp_uni_group_results <- purrr::map_dfr(names(disease_groupings), function(outcome_var) {
+  df_outcome <- twins |>
+    dplyr::select(twin_id, pair_id, age, sex, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp) |>
+    dplyr::left_join(mm_counts_full |> dplyr::select(twin_id, !!outcome_var), by = "twin_id") |>
+    dplyr::mutate(
+      !!outcome_var := dplyr::coalesce(!!rlang::sym(outcome_var), 0L),
+      sex = as.factor(sex)
+    ) |>
+    dplyr::left_join(org_clean, by = "twin_id")
+  
+  purrr::map_dfr(predictors_uni, ~fit_nb_uni_within(df_outcome, outcome_var, .x))
+}) |>
+  dplyr::group_by(outcome) |>
+  dplyr::mutate(fdr = p.adjust(p_value, method = "fdr")) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    outcome_clean = disease_groupings[outcome] |> unlist(),
+    organ_age_clean = stringr::str_replace_all(organ_age, "_", " ") |> stringr::str_to_title()
+  )
+```
+
+```{r}
+# Heatmaps for within-pair NB
+make_nb_wp_heatmap <- function(df, title_suffix) {
+  if (nrow(df) == 0) return(NULL)
+  preferred_order <- c(
+    "Brain", "Heart", "Kidney And Bladder", "Liver", "Lung",
+    "Muscle", "Pancreas", "Gastrointestinal Tract"
+  )
+  all_orgs <- unique(df$organ_age_clean)
+  available_pref <- intersect(preferred_order, all_orgs)
+  other_orgs <- setdiff(all_orgs, preferred_order)
+  organ_order <- c(available_pref, other_orgs)
+  
+  # Get available outcomes and filter to standard order
+  available_outcomes <- unique(df$outcome_clean)
+  outcome_order <- intersect(outcome_order_standard, available_outcomes)
+  
+  if (length(outcome_order) == 0 || length(organ_order) == 0) return(NULL)
+  
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  plot_df <- df |>
+    dplyr::mutate(
+      outcome_clean = factor(outcome_clean, levels = outcome_order),
+      organ_age_clean = factor(organ_age_clean, levels = organ_order),
+      outcome_num = (as.numeric(outcome_clean) - 1) * square_size + square_size/2,
+      organ_num = (as.numeric(organ_age_clean) - 1) * square_size + square_size/2,
+      effect_size_colored = dplyr::if_else(fdr < 0.05, irr, NA_real_),
+      non_sig_marker = dplyr::if_else(fdr < 0.05, "", "×")
+    )
+  
+  # Calculate dynamic range (white-to-red only, no negative values)
+  # Use irr (all values) not effect_size_colored (only significant) to capture full range
+  effect_range_all <- range(log(plot_df$irr), na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range_all[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  ggplot2::ggplot(plot_df, ggplot2::aes(x = organ_num, y = outcome_num, fill = log(effect_size_colored))) +
+    ggplot2::geom_tile(width = square_size, height = square_size, color = NA) +
+    ggplot2::geom_text(ggplot2::aes(x = organ_num, y = outcome_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    ggplot2::scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(0, max_limit * 0.5, max_limit)),
+      limits = c(0, max_limit),
+      na.value = "white",
+      name = "log(IRR)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = (seq_along(organ_order) - 1) * square_size + square_size/2,
+      labels = organ_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(organ_order) * square_size + square_size/2)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = (seq_along(outcome_order) - 1) * square_size + square_size/2,
+      labels = outcome_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(outcome_order) * square_size + square_size/2)
+    ) +
+    ggplot2::theme_minimal(base_family = "Helvetica") +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = "Helvetica", color = "black"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = ggplot2::element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = ggplot2::margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      legend.position = "right",
+      legend.title = ggplot2::element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = ggplot2::element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = grid::unit(0.8, "cm"),
+      legend.key.width = grid::unit(0.5, "cm"),
+      panel.grid = ggplot2::element_blank(),
+      panel.spacing = grid::unit(0, "lines"),
+      panel.border = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    ggplot2::coord_fixed(ratio = 1, expand = FALSE) +
+    ggplot2::labs(title = title_suffix)
+}
+
+nb_wp_uni_heatmap <- make_nb_wp_heatmap(nb_wp_uni_group_results, NULL)
+
+if (!is.null(nb_wp_uni_heatmap)) print(nb_wp_uni_heatmap)
+
+if (!is.null(nb_wp_uni_heatmap)) {
+  dir.create(file.path(output_multimorbidity_core_dir, "nb", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  ggplot2::ggsave(filename = file.path(output_multimorbidity_core_dir, "nb", "within_pair", "nb_full_withinpair_irr_heatmap.svg"), plot = nb_wp_uni_heatmap, width = 10, height = 8, dpi = 300)
+}
+```
+
+```{r nb_forest_tables_withinpair}
+# NB within-pair
+if (exists("nb_wp_uni_group_results") && nrow(nb_wp_uni_group_results) > 0) {
+  dir.create(file.path(output_multimorbidity_core_dir, "nb", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  out_keys <- unique(nb_wp_uni_group_results$outcome)
+  purrr::walk(out_keys, function(ok) {
+    df <- nb_wp_uni_group_results |>
+      dplyr::filter(outcome == ok) |>
+      dplyr::mutate(Organ_Display = clean_organ_display(organ_age))
+    p <- make_bw_forest_table(df, organ_col = "Organ_Display", eff_col = "irr", low_col = "ci_low", high_col = "ci_high", fdr_col = "fdr", title = unname(disease_groupings[ok]), axis_label = "Incidence Rate Ratio (95% CI)")
+    if (!is.null(p)) {
+      fn <- paste0("nb_forest_", stringr::str_replace_all(tolower(unname(disease_groupings[ok])), " ", "_"), "_all_pairs.svg")
+      ggplot2::ggsave(filename = fn, plot = p, path = file.path(output_multimorbidity_core_dir, "nb", "within_pair"), device = "svg", width = 7, height = 5, dpi = 300)
+    }
+  })
+  
+  # Create CSV tables directory
+  csv_dir <- file.path(output_multimorbidity_core_dir, "nb", "within_pair", "tables")
+  dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save table data as CSV
+  purrr::walk(out_keys, function(ok) {
+    csv_data <- nb_wp_uni_group_results |>
+      dplyr::filter(outcome == ok) |>
+      dplyr::mutate(
+        use_sci = pmax(abs(irr), abs(ci_low), abs(ci_high), na.rm = TRUE) >= 10,
+        use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+        irr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", irr, ci_low, ci_high),
+          sprintf("%.2f (%.2f-%.2f)", irr, ci_low, ci_high)),
+        Organ_Display = clean_organ_display(organ_age)
+      ) |>
+      dplyr::select(Organ = Organ_Display, `Effect (95% CI)` = irr_formatted, FDR = fdr)
+    
+    if (nrow(csv_data) > 0) {
+      fn <- paste0("nb_", stringr::str_replace_all(tolower(unname(disease_groupings[ok])), " ", "_"), "_all_pairs.csv")
+      write.csv(csv_data, file = file.path(csv_dir, fn), row.names = FALSE)
+    }
+  })
+}
+```
+
+## Within-Pair Negative Binomial Models (MZ Only)
+
+```{r}
+# Run within-pair NB univariate and multivariate for all groupings
+nb_wp_uni_group_results_mz <- purrr::map_dfr(names(disease_groupings), function(outcome_var) {
+  df_outcome <- twins |>
+    dplyr::select(twin_id, pair_id, age, sex, bestzyg, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp) |>
+    dplyr::filter(bestzyg == 1) |>
+    dplyr::left_join(mm_counts_full |> dplyr::select(twin_id, !!outcome_var), by = "twin_id") |>
+    dplyr::mutate(
+      !!outcome_var := dplyr::coalesce(!!rlang::sym(outcome_var), 0L),
+      sex = as.factor(sex)
+    ) |>
+    dplyr::left_join(org_clean, by = "twin_id")
+  
+  purrr::map_dfr(predictors_uni, ~fit_nb_uni_within(df_outcome, outcome_var, .x))
+}) |>
+  dplyr::group_by(outcome) |>
+  dplyr::mutate(fdr = p.adjust(p_value, method = "fdr")) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    outcome_clean = disease_groupings[outcome] |> unlist(),
+    organ_age_clean = stringr::str_replace_all(organ_age, "_", " ") |> stringr::str_to_title()
+  )
+
+# Heatmaps for MZ-only within-pair NB
+nb_wp_uni_heatmap_mz <- make_nb_wp_heatmap(nb_wp_uni_group_results_mz, NULL)
+
+if (!is.null(nb_wp_uni_heatmap_mz)) print(nb_wp_uni_heatmap_mz)
+
+if (!is.null(nb_wp_uni_heatmap_mz)) {
+  dir.create(file.path(output_multimorbidity_core_dir, "nb", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  ggplot2::ggsave(filename = file.path(output_multimorbidity_core_dir, "nb", "within_pair", "nb_full_withinpair_mz_irr_heatmap.svg"), plot = nb_wp_uni_heatmap_mz, width = 10, height = 8, dpi = 300)
+}
+```
+
+```{r nb_forest_tables_withinpair_mz}
+# NB within-pair (MZ)
+if (exists("nb_wp_uni_group_results_mz") && nrow(nb_wp_uni_group_results_mz) > 0) {
+  dir.create(file.path(output_multimorbidity_core_dir, "nb", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  out_keys <- unique(nb_wp_uni_group_results_mz$outcome)
+  purrr::walk(out_keys, function(ok) {
+    df <- nb_wp_uni_group_results_mz |>
+      dplyr::filter(outcome == ok) |>
+      dplyr::mutate(Organ_Display = clean_organ_display(organ_age))
+    p <- make_bw_forest_table(df, organ_col = "Organ_Display", eff_col = "irr", low_col = "ci_low", high_col = "ci_high", fdr_col = "fdr", title = unname(disease_groupings[ok]), axis_label = "Incidence Rate Ratio (95% CI)")
+    if (!is.null(p)) {
+      fn <- paste0("nb_forest_", stringr::str_replace_all(tolower(unname(disease_groupings[ok])), " ", "_"), "_mz_twins.svg")
+      ggplot2::ggsave(filename = fn, plot = p, path = file.path(output_multimorbidity_core_dir, "nb", "within_pair"), device = "svg", width = 7, height = 5, dpi = 300)
+    }
+  }  )
+  
+  # Save CSV for MZ twins
+  purrr::walk(out_keys, function(ok) {
+    csv_data <- nb_wp_uni_group_results_mz |>
+      dplyr::filter(outcome == ok) |>
+      dplyr::mutate(
+        use_sci = pmax(abs(irr), abs(ci_low), abs(ci_high), na.rm = TRUE) >= 10,
+        use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+        irr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", irr, ci_low, ci_high),
+          sprintf("%.2f (%.2f-%.2f)", irr, ci_low, ci_high)),
+        Organ_Display = clean_organ_display(organ_age)
+      ) |>
+      dplyr::select(Organ = Organ_Display, `Effect (95% CI)` = irr_formatted, FDR = fdr)
+    
+    if (nrow(csv_data) > 0) {
+      fn <- paste0("nb_", stringr::str_replace_all(tolower(unname(disease_groupings[ok])), " ", "_"), "_mz_twins.csv")
+      write.csv(csv_data, file = file.path(csv_dir, fn), row.names = FALSE)
+    }
+  })
+}
+```
+
+# Andersen-Gill Models
+
+```{r}
+# Prepare start–stop data
+organ_age_mortality_clean <- org_clean
+
+twins_fu <- twins |>
+  dplyr::select(twin_id, age, sex, time_to_death, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp) |>
+  dplyr::mutate(
+    person_years = time_to_death / 365.25,
+    sex = as.factor(sex)
+  ) |>
+  dplyr::left_join(
+    composite_diseases |> janitor::clean_names() |> dplyr::select(twin_id, prevalent_mm),
+    by = "twin_id"
+  ) |>
+  dplyr::mutate(prevalent_mm = dplyr::coalesce(prevalent_mm, 0))
+
+events <- timeline |>
+  dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+  dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+  dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+  dplyr::arrange(twin_id, event_time) |>
+  dplyr::group_by(twin_id) |>
+  dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+  dplyr::ungroup()
+
+censor <- twins_fu |>
+  dplyr::select(twin_id, person_years) |>
+  dplyr::left_join(events |>
+    dplyr::group_by(twin_id) |>
+    dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"), by = "twin_id") |>
+  dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+  dplyr::select(twin_id, start, stop, event)
+
+ag_df <- dplyr::bind_rows(
+  events |> dplyr::select(twin_id, start, stop, event),
+  censor
+) |>
+  dplyr::filter(stop > start, is.finite(stop)) |>
+  dplyr::left_join(twins_fu |> dplyr::select(twin_id, age, sex, prevalent_mm, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp), by = "twin_id") |>
+  dplyr::left_join(twins |> dplyr::select(twin_id, pair_id), by = "twin_id") |>
+  dplyr::left_join(organ_age_mortality_clean, by = "twin_id")
+
+# Organ columns for univariate models (include all organs)
+organ_cols_ag_uni <- organ_age_mortality_clean |>
+  dplyr::select(-twin_id) |>
+  names()
+
+fit_ag_uni <- function(data, predictor) {
+  fml <- stats::as.formula(paste("survival::Surv(start, stop, event) ~", predictor, "+ prevalent_mm +", covariate_formula_terms, "+ cluster(twin_id)"))
+  out <- tryCatch({
+    mdl <- survival::coxph(fml, data = data, ties = "efron")
+    s <- summary(mdl)
+    coefs <- s$coefficients
+    rn <- rownames(coefs)
+    term <- if (predictor %in% rn) predictor else {
+      hit <- grep(predictor, rn, fixed = TRUE, value = TRUE)
+      if (length(hit) > 0) hit[1] else NA_character_
+    }
+    if (is.na(term)) {
+      return(dplyr::tibble(
+        organ_age = predictor,
+        hr = NA_real_, ci_low = NA_real_, ci_high = NA_real_, p_value = NA_real_
+      ))
+    }
+    se_col <- if ("robust se" %in% colnames(coefs)) "robust se" else if ("se(coef)" %in% colnames(coefs)) "se(coef)" else colnames(coefs)[grepl("se", colnames(coefs), ignore.case = TRUE)][1]
+    coef_val <- coefs[term, "coef"]
+    se_val <- coefs[term, se_col]
+    p_col <- if ("Pr(>|z|)" %in% colnames(coefs)) "Pr(>|z|)" else NA_character_
+    p_val <- if (!is.na(p_col)) coefs[term, p_col] else 2 * stats::pnorm(-abs(coef_val / se_val))
+    dplyr::tibble(
+      organ_age = predictor,
+      hr = exp(coef_val),
+      ci_low = exp(coef_val - 1.96 * se_val),
+      ci_high = exp(coef_val + 1.96 * se_val),
+      p_value = p_val
+    )
+  }, error = function(e) {
+    dplyr::tibble(
+      organ_age = predictor,
+      hr = NA_real_, ci_low = NA_real_, ci_high = NA_real_, p_value = NA_real_
+    )
+  })
+  out
+}
+
+ag_uni_results <- purrr::map_dfr(organ_cols_ag_uni, ~fit_ag_uni(ag_df, .x)) |>
+  dplyr::mutate(
+    fdr = p.adjust(p_value, method = "fdr")
+  )
+```
+
+## Andersen-Gill Models Across Disease Groupings
+
+### Sensitivity: Healthy Baseline Cohort
+
+```{r}
+# Create healthy baseline cohort
+twins_fu_healthy <- twins_fu |>
+  dplyr::filter(prevalent_mm == 0)
+
+# Build AG data per grouping for healthy cohort only
+build_ag_df_for_group_healthy <- function(disease_labels) {
+  events_g <- timeline |>
+    dplyr::filter(.data[[label_col]] %in% disease_labels) |>
+    dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+    dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+    dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+    dplyr::arrange(twin_id, event_time) |>
+    dplyr::group_by(twin_id) |>
+    dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+    dplyr::ungroup()
+
+  censor_g <- twins_fu_healthy |>
+    dplyr::select(twin_id, person_years) |>
+    dplyr::left_join(events_g |>
+      dplyr::group_by(twin_id) |>
+      dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"), by = "twin_id") |>
+    dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+    dplyr::select(twin_id, start, stop, event)
+
+  dplyr::bind_rows(events_g |> dplyr::select(twin_id, start, stop, event), censor_g) |>
+    dplyr::filter(stop > start, is.finite(stop)) |>
+    dplyr::left_join(twins_fu_healthy |> dplyr::select(twin_id, age, sex, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp), by = "twin_id") |>
+    dplyr::left_join(twins |> dplyr::select(twin_id, pair_id), by = "twin_id") |>
+    dplyr::left_join(organ_age_mortality_clean, by = "twin_id")
+}
+
+# AG univariate function for healthy cohort (no prevalent_mm needed)
+fit_ag_uni_healthy <- function(data, predictor) {
+  fml <- stats::as.formula(paste("survival::Surv(start, stop, event) ~", predictor, "+", covariate_formula_terms, "+ cluster(twin_id)"))
+  out <- tryCatch({
+    mdl <- survival::coxph(fml, data = data, ties = "efron")
+    s <- summary(mdl)
+    coefs <- s$coefficients
+    rn <- rownames(coefs)
+    term <- if (predictor %in% rn) predictor else {
+      hit <- grep(predictor, rn, fixed = TRUE, value = TRUE)
+      if (length(hit) > 0) hit[1] else NA_character_
+    }
+    if (is.na(term)) {
+      return(dplyr::tibble(
+        organ_age = predictor,
+        hr = NA_real_, ci_low = NA_real_, ci_high = NA_real_, p_value = NA_real_
+      ))
+    }
+    se_col <- if ("robust se" %in% colnames(coefs)) "robust se" else if ("se(coef)" %in% colnames(coefs)) "se(coef)" else colnames(coefs)[grepl("se", colnames(coefs), ignore.case = TRUE)][1]
+    coef_val <- coefs[term, "coef"]
+    se_val <- coefs[term, se_col]
+    p_col <- if ("Pr(>|z|)" %in% colnames(coefs)) "Pr(>|z|)" else NA_character_
+    p_val <- if (!is.na(p_col)) coefs[term, p_col] else 2 * stats::pnorm(-abs(coef_val / se_val))
+    dplyr::tibble(
+      organ_age = predictor,
+      hr = exp(coef_val),
+      ci_low = exp(coef_val - 1.96 * se_val),
+      ci_high = exp(coef_val + 1.96 * se_val),
+      p_value = p_val
+    )
+  }, error = function(e) {
+    dplyr::tibble(
+      organ_age = predictor,
+      hr = NA_real_, ci_low = NA_real_, ci_high = NA_real_, p_value = NA_real_
+    )
+  })
+  out
+}
+
+# Run AG univariate models for healthy cohort
+ag_uni_healthy_results <- purrr::map_dfr(names(disease_groupings), function(nm) {
+  df_g <- build_ag_df_for_group_healthy(group_vectors[[nm]])
+  if (nrow(df_g) == 0) return(tibble::tibble())
+  purrr::map_dfr(organ_cols_ag_uni, ~fit_ag_uni_healthy(df_g, .x)) |>
+    dplyr::mutate(group_key = nm)
+}) |>
+  dplyr::group_by(group_key) |>
+  dplyr::mutate(fdr = p.adjust(p_value, method = "fdr")) |>
+  dplyr::ungroup()
+
+# Create heatmap for healthy cohort AG univariate results
+ag_healthy_heatmap_df <- ag_uni_healthy_results |>
+  dplyr::mutate(
+    outcome_clean = disease_groupings[group_key] |> unlist(),
+    organ_age_clean = stringr::str_replace_all(organ_age, "_", " ") |> stringr::str_to_title(),
+    effect_size = hr,
+    effect_size_colored = dplyr::if_else(fdr < 0.05, hr, NA_real_),
+    non_sig_marker = dplyr::if_else(fdr < 0.05, "", "×")
+  ) |>
+  dplyr::select(outcome_clean, organ_age_clean, effect_size, effect_size_colored, non_sig_marker, fdr) |>
+  dplyr::filter(!is.na(effect_size))
+
+# Organ order for healthy cohort
+all_orgs_healthy <- unique(ag_healthy_heatmap_df$organ_age_clean)
+available_pref_healthy <- intersect(preferred_order, all_orgs_healthy)
+other_orgs_healthy <- setdiff(all_orgs_healthy, preferred_order)
+organ_order_healthy <- c(available_pref_healthy, other_orgs_healthy)
+
+plot_ag_healthy_df <- ag_healthy_heatmap_df |>
+  dplyr::mutate(
+    outcome_clean = factor(outcome_clean, levels = outcome_order_standard),
+    organ_age_clean = factor(organ_age_clean, levels = organ_order_healthy)
+  )
+
+if (length(unique(plot_ag_healthy_df$outcome_clean)) == 0 || length(unique(plot_ag_healthy_df$organ_age_clean)) == 0) {
+  ag_healthy_heatmap <- NULL
+} else {
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  # Calculate dynamic range (white-to-red only, no negative values)
+  # Use effect_size (all values) not effect_size_colored (only significant) to capture full range
+  effect_range <- range(log(plot_ag_healthy_df$effect_size), na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  # Prepare data with numeric coordinates
+  plot_ag_healthy_df <- plot_ag_healthy_df |>
+    dplyr::mutate(
+      outcome_num = (as.numeric(outcome_clean) - 1) * square_size + square_size/2,
+      organ_num = (as.numeric(organ_age_clean) - 1) * square_size + square_size/2
+    )
+  
+  outcome_order <- levels(plot_ag_healthy_df$outcome_clean)
+  organ_order <- levels(plot_ag_healthy_df$organ_age_clean)
+  
+  ag_healthy_heatmap <- ggplot2::ggplot(plot_ag_healthy_df, ggplot2::aes(x = organ_num, y = outcome_num, fill = log(effect_size_colored))) +
+    ggplot2::geom_tile(width = square_size, height = square_size, color = NA) +
+    ggplot2::geom_text(ggplot2::aes(x = organ_num, y = outcome_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    ggplot2::scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(0, max_limit * 0.5, max_limit)),
+      limits = c(0, max_limit),
+      na.value = "white",
+      name = "log(HR)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = (seq_along(organ_order) - 1) * square_size + square_size/2,
+      labels = organ_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(organ_order) * square_size + square_size/2)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = (seq_along(outcome_order) - 1) * square_size + square_size/2,
+      labels = outcome_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(outcome_order) * square_size + square_size/2)
+    ) +
+    ggplot2::theme_minimal(base_family = "Helvetica") +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = "Helvetica", color = "black"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = ggplot2::element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = ggplot2::margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      legend.position = "right",
+      legend.title = ggplot2::element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = ggplot2::element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = grid::unit(0.8, "cm"),
+      legend.key.width = grid::unit(0.5, "cm"),
+      panel.grid = ggplot2::element_blank(),
+      panel.spacing = grid::unit(0, "lines"),
+      panel.border = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    ggplot2::coord_fixed(ratio = 1, expand = FALSE) +
+    ggplot2::labs(title = "AG Univariate: Healthy at Baseline Only")
+}
+
+print(ag_healthy_heatmap)
+
+# Save healthy cohort heatmap
+dir.create(file.path(output_multimorbidity_core_dir, "ag", "main"), recursive = TRUE, showWarnings = FALSE)
+if (!is.null(ag_healthy_heatmap)) {
+  ggplot2::ggsave(
+    filename = file.path(output_multimorbidity_core_dir, "ag", "main", "ag_healthy_main_hr_heatmap.svg"),
+    plot = ag_healthy_heatmap,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+```
+
+## Full Cohort AG Models
+
+```{r}
+# Build AG data per grouping
+build_ag_df_for_group <- function(disease_labels) {
+  events_g <- timeline |>
+    dplyr::filter(.data[[label_col]] %in% disease_labels) |>
+    dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+    dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+    dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+    dplyr::arrange(twin_id, event_time) |>
+    dplyr::group_by(twin_id) |>
+    dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+    dplyr::ungroup()
+
+  censor_g <- twins_fu |>
+    dplyr::select(twin_id, person_years) |>
+    dplyr::left_join(events_g |>
+      dplyr::group_by(twin_id) |>
+      dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"), by = "twin_id") |>
+    dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+    dplyr::select(twin_id, start, stop, event)
+
+  dplyr::bind_rows(
+    events_g |> dplyr::select(twin_id, start, stop, event),
+    censor_g
+  ) |>
+    dplyr::filter(stop > start, is.finite(stop)) |>
+    dplyr::left_join(twins_fu |> dplyr::select(twin_id, age, sex, prevalent_mm, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp), by = "twin_id") |>
+    dplyr::left_join(organ_age_mortality_clean, by = "twin_id")
+}
+
+ag_group_results <- purrr::map_dfr(names(group_vectors), function(nm) {
+  df_g <- build_ag_df_for_group(group_vectors[[nm]])
+  if (nrow(df_g) == 0) return(tibble::tibble())
+  purrr::map_dfr(organ_cols_ag_uni, ~fit_ag_uni(df_g, .x)) |>
+    dplyr::mutate(group_key = nm)
+}) |>
+  dplyr::group_by(group_key) |>
+  dplyr::mutate(fdr = p.adjust(p_value, method = "fdr")) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    group_display = unname(disease_groupings[group_key]),
+    organ_age_clean = stringr::str_replace_all(organ_age, "_", " ") |> stringr::str_to_title()
+  )
+```
+
+```{r}
+# Heatmap across all disease groupings
+ag_groups_heatmap_df <- ag_group_results |>
+  dplyr::transmute(
+    outcome_clean = group_display,
+    organ_age_clean,
+    effect_size = hr,
+    significance = dplyr::case_when(
+      fdr < 0.001 ~ "***",
+      fdr < 0.01 ~ "**",
+      fdr < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    effect_size_colored = dplyr::if_else(significance != "", effect_size, NA_real_),
+    non_sig_marker = dplyr::if_else(significance == "", "×", "")
+  ) |>
+  dplyr::filter(!is.na(effect_size))
+
+# Organ order reused
+preferred_order <- c(
+  "Brain", "Heart", "Kidney And Bladder", "Liver", "Lung",
+  "Muscle", "Pancreas", "Gastrointestinal Tract"
+)
+all_orgs_groups <- unique(ag_groups_heatmap_df$organ_age_clean)
+available_pref_groups <- intersect(preferred_order, all_orgs_groups)
+other_orgs_groups <- setdiff(all_orgs_groups, preferred_order)
+organ_order_groups <- c(available_pref_groups, other_orgs_groups)
+
+plot_ag_groups_df <- ag_groups_heatmap_df |>
+  dplyr::mutate(
+    outcome_clean = factor(outcome_clean, levels = outcome_order_standard),
+    organ_age_clean = factor(organ_age_clean, levels = organ_order_groups)
+  )
+
+if (length(unique(plot_ag_groups_df$outcome_clean)) == 0 || length(unique(plot_ag_groups_df$organ_age_clean)) == 0) {
+  ag_groups_heatmap <- NULL
+} else {
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  # Calculate dynamic range (white-to-red only, no negative values)
+  # Use effect_size (all values) not effect_size_colored (only significant) to capture full range
+  effect_range <- range(log(plot_ag_groups_df$effect_size), na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  # Prepare data with numeric coordinates
+  plot_ag_groups_df <- plot_ag_groups_df |>
+    dplyr::mutate(
+      outcome_num = (as.numeric(outcome_clean) - 1) * square_size + square_size/2,
+      organ_num = (as.numeric(organ_age_clean) - 1) * square_size + square_size/2
+    )
+  
+  outcome_order <- levels(plot_ag_groups_df$outcome_clean)
+  organ_order <- levels(plot_ag_groups_df$organ_age_clean)
+  
+  ag_groups_heatmap <- ggplot2::ggplot(plot_ag_groups_df, ggplot2::aes(x = organ_num, y = outcome_num, fill = log(effect_size_colored))) +
+    ggplot2::geom_tile(width = square_size, height = square_size, color = NA) +
+    ggplot2::geom_text(ggplot2::aes(x = organ_num, y = outcome_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    ggplot2::scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      limits = c(min_limit, max_limit),
+      na.value = "white",
+      name = "log(HR)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = (seq_along(organ_order) - 1) * square_size + square_size/2,
+      labels = organ_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(organ_order) * square_size + square_size/2)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = (seq_along(outcome_order) - 1) * square_size + square_size/2,
+      labels = outcome_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(outcome_order) * square_size + square_size/2)
+    ) +
+    ggplot2::theme_minimal(base_family = "Helvetica") +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = "Helvetica", color = "black"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = ggplot2::element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = ggplot2::margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      legend.position = "right",
+      legend.title = ggplot2::element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = ggplot2::element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = grid::unit(0.8, "cm"),
+      legend.key.width = grid::unit(0.5, "cm"),
+      panel.grid = ggplot2::element_blank(),
+      panel.spacing = grid::unit(0, "lines"),
+      panel.border = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    ggplot2::coord_fixed(ratio = 1, expand = FALSE)
+}
+
+print(ag_groups_heatmap)
+
+dir.create(file.path(output_multimorbidity_core_dir, "ag", "main"), recursive = TRUE, showWarnings = FALSE)
+if (!is.null(ag_groups_heatmap)) {
+  ggplot2::ggsave(
+    filename = file.path(output_multimorbidity_core_dir, "ag", "main", "ag_full_main_hr_heatmap.svg"),
+    plot = ag_groups_heatmap,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+```
+
+## Forest tables: AG main and within-pair
+```{r ag_forest_tables}
+# AG main
+if (exists("ag_group_results") && nrow(ag_group_results) > 0) {
+  dir.create(file.path(output_multimorbidity_core_dir, "ag", "main"), recursive = TRUE, showWarnings = FALSE)
+  out_keys <- unique(ag_group_results$group_display)
+  purrr::walk(out_keys, function(lbl) {
+    df <- ag_group_results |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(Organ_Display = clean_organ_display(organ_age))
+    p <- make_bw_forest_table(df, organ_col = "Organ_Display", eff_col = "hr", low_col = "ci_low", high_col = "ci_high", fdr_col = "fdr", title = lbl, axis_label = "Hazard Ratio (95% CI)")
+    if (!is.null(p)) {
+      fn <- paste0("ag_forest_", stringr::str_replace_all(tolower(lbl), " ", "_"), ".svg")
+      ggplot2::ggsave(filename = fn, plot = p, path = file.path(output_multimorbidity_core_dir, "ag", "main"), device = "svg", width = 7, height = 5, dpi = 300)
+    }
+  })
+  
+  # Create CSV tables directory
+  csv_dir <- file.path(output_multimorbidity_core_dir, "ag", "main", "tables")
+  dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save table data as CSV
+  purrr::walk(out_keys, function(lbl) {
+    csv_data <- ag_group_results |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(
+        use_sci = pmax(abs(hr), abs(ci_low), abs(ci_high), na.rm = TRUE) >= 10,
+        use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+        hr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", hr, ci_low, ci_high),
+          sprintf("%.2f (%.2f-%.2f)", hr, ci_low, ci_high)),
+        Organ_Display = clean_organ_display(organ_age)
+      ) |>
+      dplyr::select(Organ = Organ_Display, `Effect (95% CI)` = hr_formatted, FDR = fdr)
+    
+    if (nrow(csv_data) > 0) {
+      fn <- paste0("ag_", stringr::str_replace_all(tolower(lbl), " ", "_"), ".csv")
+      write.csv(csv_data, file = file.path(csv_dir, fn), row.names = FALSE)
+    }
+  })
+}
+
+# AG within-pair
+if (exists("ag_wp_uni_group_results") && nrow(ag_wp_uni_group_results) > 0) {
+  dir.create(file.path(output_multimorbidity_core_dir, "ag", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  out_keys <- unique(ag_wp_uni_group_results$group_display)
+  purrr::walk(out_keys, function(lbl) {
+    df <- ag_wp_uni_group_results |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(Organ_Display = clean_organ_display(organ_age))
+    p <- make_bw_forest_table(df, organ_col = "Organ_Display", eff_col = "hr", low_col = "ci_low", high_col = "ci_high", fdr_col = "fdr", title = lbl, axis_label = "Hazard Ratio (95% CI)")
+    if (!is.null(p)) {
+      fn <- paste0("ag_forest_", stringr::str_replace_all(tolower(lbl), " ", "_"), "_all_pairs.svg")
+      ggplot2::ggsave(filename = fn, plot = p, path = file.path(output_multimorbidity_core_dir, "ag", "within_pair"), device = "svg", width = 7, height = 5, dpi = 300)
+    }
+  })
+  
+  # Create CSV tables directory
+  csv_dir <- file.path(output_multimorbidity_core_dir, "ag", "within_pair", "tables")
+  dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save table data as CSV
+  purrr::walk(out_keys, function(lbl) {
+    csv_data <- ag_wp_uni_group_results |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(
+        use_sci = pmax(abs(hr), abs(ci_low), abs(ci_high), na.rm = TRUE) >= 10,
+        use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+        hr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", hr, ci_low, ci_high),
+          sprintf("%.2f (%.2f-%.2f)", hr, ci_low, ci_high)),
+        Organ_Display = clean_organ_display(organ_age)
+      ) |>
+      dplyr::select(Organ = Organ_Display, `Effect (95% CI)` = hr_formatted, FDR = fdr)
+    
+    if (nrow(csv_data) > 0) {
+      fn <- paste0("ag_", stringr::str_replace_all(tolower(lbl), " ", "_"), "_all_pairs.csv")
+      write.csv(csv_data, file = file.path(csv_dir, fn), row.names = FALSE)
+    }
+  })
+}
+
+# AG within-pair (MZ)
+if (exists("ag_wp_uni_group_results_mz") && nrow(ag_wp_uni_group_results_mz) > 0) {
+  dir.create(file.path(output_multimorbidity_core_dir, "ag", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  out_keys <- unique(ag_wp_uni_group_results_mz$group_display)
+  purrr::walk(out_keys, function(lbl) {
+    df <- ag_wp_uni_group_results_mz |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(Organ_Display = clean_organ_display(organ_age))
+    p <- make_bw_forest_table(df, organ_col = "Organ_Display", eff_col = "hr", low_col = "ci_low", high_col = "ci_high", fdr_col = "fdr", title = lbl, axis_label = "Hazard Ratio (95% CI)")
+    if (!is.null(p)) {
+      fn <- paste0("ag_forest_", stringr::str_replace_all(tolower(lbl), " ", "_"), "_mz_twins.svg")
+      ggplot2::ggsave(filename = fn, plot = p, path = file.path(output_multimorbidity_core_dir, "ag", "within_pair"), device = "svg", width = 7, height = 5, dpi = 300)
+    }
+  })
+  
+  # Create CSV tables directory for MZ twins
+  csv_dir <- file.path(output_multimorbidity_core_dir, "ag", "within_pair", "tables")
+  dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save CSV for MZ twins
+  purrr::walk(out_keys, function(lbl) {
+    csv_data <- ag_wp_uni_group_results_mz |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(
+        use_sci = pmax(abs(hr), abs(ci_low), abs(ci_high), na.rm = TRUE) >= 10,
+        use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+        hr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", hr, ci_low, ci_high),
+          sprintf("%.2f (%.2f-%.2f)", hr, ci_low, ci_high)),
+        Organ_Display = clean_organ_display(organ_age)
+      ) |>
+      dplyr::select(Organ = Organ_Display, `Effect (95% CI)` = hr_formatted, FDR = fdr)
+    
+    if (nrow(csv_data) > 0) {
+      fn <- paste0("ag_", stringr::str_replace_all(tolower(lbl), " ", "_"), "_mz_twins.csv")
+      write.csv(csv_data, file = file.path(csv_dir, fn), row.names = FALSE)
+    }
+  })
+}
+```
+
+# Within-Pair Andersen-Gill Models
+
+```{r}
+# Build within-pair AG data for a disease grouping
+essential_withinpair_ag_df_for_group <- function(disease_labels) {
+  events_g <- timeline |>
+    dplyr::filter(.data[[label_col]] %in% disease_labels) |>
+    dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+    dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+    dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+    dplyr::arrange(twin_id, event_time) |>
+    dplyr::group_by(twin_id) |>
+    dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+    dplyr::ungroup()
+
+  censor_g <- twins_fu |>
+    dplyr::select(twin_id, person_years) |>
+    dplyr::left_join(events_g |>
+      dplyr::group_by(twin_id) |>
+      dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"), by = "twin_id") |>
+    dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+    dplyr::select(twin_id, start, stop, event)
+
+  dplyr::bind_rows(
+    events_g |> dplyr::select(twin_id, start, stop, event),
+    censor_g
+  ) |>
+    dplyr::filter(stop > start, is.finite(stop)) |>
+    dplyr::left_join(twins_fu |> dplyr::select(twin_id, age, sex, prevalent_mm, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp), by = "twin_id") |>
+    dplyr::left_join(twins |> dplyr::select(twin_id, pair_id), by = "twin_id") |>
+    dplyr::left_join(organ_age_mortality_clean, by = "twin_id")
+}
+
+fit_ag_uni_within <- function(data, predictor) {
+  fml <- stats::as.formula(paste("survival::Surv(start, stop, event) ~", predictor, "+ prevalent_mm +", covariate_formula_terms, "+ strata(pair_id) + cluster(pair_id)"))
+  out <- tryCatch({
+    mdl <- survival::coxph(fml, data = data, ties = "efron")
+    s <- summary(mdl)
+    coefs <- s$coefficients
+    rn <- rownames(coefs)
+    term <- if (predictor %in% rn) predictor else { hit <- grep(predictor, rn, fixed = TRUE, value = TRUE); if (length(hit) > 0) hit[1] else NA_character_ }
+    if (is.na(term)) return(tibble::tibble(organ_age = predictor, hr = NA_real_, ci_low = NA_real_, ci_high = NA_real_, p_value = NA_real_))
+    se_col <- if ("robust se" %in% colnames(coefs)) "robust se" else if ("se(coef)" %in% colnames(coefs)) "se(coef)" else colnames(coefs)[grepl("se", colnames(coefs), ignore.case = TRUE)][1]
+    coef_val <- coefs[term, "coef"]; se_val <- coefs[term, se_col]
+    p_col <- if ("Pr(>|z|)" %in% colnames(coefs)) "Pr(>|z|)" else NA_character_
+    p_val <- if (!is.na(p_col)) coefs[term, p_col] else 2 * stats::pnorm(-abs(coef_val / se_val))
+    tibble::tibble(
+      organ_age = predictor,
+      hr = exp(coef_val),
+      ci_low = exp(coef_val - 1.96 * se_val),
+      ci_high = exp(coef_val + 1.96 * se_val),
+      p_value = p_val
+    )
+  }, error = function(e) tibble::tibble(organ_age = predictor, hr = NA_real_, ci_low = NA_real_, ci_high = NA_real_, p_value = NA_real_))
+  out
+}
+
+# Run within-pair univariate and multivariate for all groupings
+ag_wp_uni_group_results <- purrr::map_dfr(names(group_vectors), function(nm) {
+  df_g <- essential_withinpair_ag_df_for_group(group_vectors[[nm]])
+  if (nrow(df_g) == 0) return(tibble::tibble())
+  purrr::map_dfr(organ_cols_ag_uni, ~fit_ag_uni_within(df_g, .x)) |>
+    dplyr::mutate(group_key = nm)
+}) |>
+  dplyr::group_by(group_key) |>
+  dplyr::mutate(fdr = p.adjust(p_value, method = "fdr")) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    group_display = unname(disease_groupings[group_key]),
+    organ_age_clean = stringr::str_replace_all(organ_age, "_", " ") |> stringr::str_to_title()
+  )
+```
+
+```{r}
+# Heatmaps (within-pair):
+make_wp_heatmap <- function(df, title_suffix) {
+  if (nrow(df) == 0) return(NULL)
+  preferred_order <- c(
+    "Brain", "Heart", "Kidney And Bladder", "Liver", "Lung",
+    "Muscle", "Pancreas", "Gastrointestinal Tract"
+  )
+  all_orgs <- unique(df$organ_age_clean)
+  available_pref <- intersect(preferred_order, all_orgs)
+  other_orgs <- setdiff(all_orgs, preferred_order)
+  organ_order <- c(available_pref, other_orgs)
+  
+  # Get available outcomes and filter to standard order
+  available_outcomes <- unique(df$group_display)
+  outcome_order <- intersect(outcome_order_standard, available_outcomes)
+  
+  if (length(outcome_order) == 0 || length(organ_order) == 0) return(NULL)
+  
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  plot_df <- df |>
+    dplyr::mutate(
+      outcome_clean = factor(group_display, levels = outcome_order),
+      organ_age_clean = factor(organ_age_clean, levels = organ_order),
+      outcome_num = (as.numeric(outcome_clean) - 1) * square_size + square_size/2,
+      organ_num = (as.numeric(organ_age_clean) - 1) * square_size + square_size/2,
+      effect_size_colored = dplyr::if_else(fdr < 0.05, hr, NA_real_),
+      non_sig_marker = dplyr::if_else(fdr < 0.05, "", "×")
+    )
+  
+  # Calculate dynamic range (white-to-red only, no negative values)
+  # Use hr (all values) not effect_size_colored (only significant) to capture full range
+  effect_range_all <- range(log(plot_df$hr), na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range_all[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  ggplot2::ggplot(plot_df, ggplot2::aes(x = organ_num, y = outcome_num, fill = log(effect_size_colored))) +
+    ggplot2::geom_tile(width = square_size, height = square_size, color = NA) +
+    ggplot2::geom_text(ggplot2::aes(x = organ_num, y = outcome_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    ggplot2::scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(0, max_limit * 0.5, max_limit)),
+      limits = c(0, max_limit),
+      na.value = "white",
+      name = "log(HR)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = (seq_along(organ_order) - 1) * square_size + square_size/2,
+      labels = organ_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(organ_order) * square_size + square_size/2)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = (seq_along(outcome_order) - 1) * square_size + square_size/2,
+      labels = outcome_order,
+      expand = c(0, 0),
+      limits = c(-square_size/2, length(outcome_order) * square_size + square_size/2)
+    ) +
+    ggplot2::theme_minimal(base_family = "Helvetica") +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = "Helvetica", color = "black"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = ggplot2::element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = ggplot2::margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      legend.position = "right",
+      legend.title = ggplot2::element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = ggplot2::element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = grid::unit(0.8, "cm"),
+      legend.key.width = grid::unit(0.5, "cm"),
+      panel.grid = ggplot2::element_blank(),
+      panel.spacing = grid::unit(0, "lines"),
+      panel.border = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    ggplot2::coord_fixed(ratio = 1, expand = FALSE) +
+    ggplot2::labs(title = title_suffix)
+}
+
+wp_uni_heatmap <- make_wp_heatmap(ag_wp_uni_group_results, NULL)
+
+if (!is.null(wp_uni_heatmap)) print(wp_uni_heatmap)
+
+if (!is.null(wp_uni_heatmap)) {
+  dir.create(file.path(output_multimorbidity_core_dir, "ag", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  ggplot2::ggsave(filename = file.path(output_multimorbidity_core_dir, "ag", "within_pair", "ag_full_withinpair_hr_heatmap.svg"), plot = wp_uni_heatmap, width = 10, height = 8, dpi = 300)
+}
+```
+
+```{r ag_forest_tables_withinpair}
+# AG within-pair
+if (exists("ag_wp_uni_group_results") && nrow(ag_wp_uni_group_results) > 0) {
+  dir.create(file.path(output_multimorbidity_core_dir, "ag", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  out_keys <- unique(ag_wp_uni_group_results$group_display)
+  purrr::walk(out_keys, function(lbl) {
+    df <- ag_wp_uni_group_results |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(Organ_Display = clean_organ_display(organ_age))
+    p <- make_bw_forest_table(df, organ_col = "Organ_Display", eff_col = "hr", low_col = "ci_low", high_col = "ci_high", fdr_col = "fdr", title = lbl, axis_label = "Hazard Ratio (95% CI)")
+    if (!is.null(p)) {
+      fn <- paste0("ag_forest_", stringr::str_replace_all(tolower(lbl), " ", "_"), "_all_pairs.svg")
+      ggplot2::ggsave(filename = fn, plot = p, path = file.path(output_multimorbidity_core_dir, "ag", "within_pair"), device = "svg", width = 7, height = 5, dpi = 300)
+    }
+  })
+  
+  # Create CSV tables directory
+  csv_dir <- file.path(output_multimorbidity_core_dir, "ag", "within_pair", "tables")
+  dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save CSV for all pairs
+  purrr::walk(out_keys, function(lbl) {
+    csv_data <- ag_wp_uni_group_results |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(
+        use_sci = pmax(abs(hr), abs(ci_low), abs(ci_high), na.rm = TRUE) >= 10,
+        use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+        hr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", hr, ci_low, ci_high),
+          sprintf("%.2f (%.2f-%.2f)", hr, ci_low, ci_high)),
+        Organ_Display = clean_organ_display(organ_age)
+      ) |>
+      dplyr::select(Organ = Organ_Display, `Effect (95% CI)` = hr_formatted, FDR = fdr)
+    
+    if (nrow(csv_data) > 0) {
+      fn <- paste0("ag_", stringr::str_replace_all(tolower(lbl), " ", "_"), "_all_pairs.csv")
+      write.csv(csv_data, file = file.path(csv_dir, fn), row.names = FALSE)
+    }
+  })
+}
+```
+
+## Within-Pair Andersen-Gill Models (MZ Only)
+
+```{r}
+# Build within-pair AG data (MZ) for a disease grouping
+essential_withinpair_ag_df_for_group_mz <- function(disease_labels) {
+  events_g <- timeline |>
+    dplyr::filter(.data[[label_col]] %in% disease_labels) |>
+    dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+    dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+    dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+    dplyr::arrange(twin_id, event_time) |>
+    dplyr::group_by(twin_id) |>
+    dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+    dplyr::ungroup()
+
+  censor_g <- twins_fu |>
+    dplyr::select(twin_id, person_years) |>
+    dplyr::left_join(events_g |>
+      dplyr::group_by(twin_id) |>
+      dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"), by = "twin_id") |>
+    dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+    dplyr::select(twin_id, start, stop, event)
+
+  dplyr::bind_rows(
+    events_g |> dplyr::select(twin_id, start, stop, event),
+    censor_g
+  ) |>
+    dplyr::filter(stop > start, is.finite(stop)) |>
+    dplyr::left_join(twins_fu |> dplyr::select(twin_id, age, sex, prevalent_mm, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp), by = "twin_id") |>
+    dplyr::left_join(twins |> dplyr::select(twin_id, pair_id, bestzyg), by = "twin_id") |>
+    dplyr::filter(bestzyg == 1) |>
+    dplyr::left_join(organ_age_mortality_clean, by = "twin_id")
+}
+
+# Run within-pair
+ag_wp_uni_group_results_mz <- purrr::map_dfr(names(group_vectors), function(nm) {
+  df_g <- essential_withinpair_ag_df_for_group_mz(group_vectors[[nm]])
+  if (nrow(df_g) == 0) return(tibble::tibble())
+  purrr::map_dfr(organ_cols_ag_uni, ~fit_ag_uni_within(df_g, .x)) |>
+    dplyr::mutate(group_key = nm)
+}) |>
+  dplyr::group_by(group_key) |>
+  dplyr::mutate(fdr = p.adjust(p_value, method = "fdr")) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    group_display = unname(disease_groupings[group_key]),
+    organ_age_clean = stringr::str_replace_all(organ_age, "_", " ") |> stringr::str_to_title()
+  )
+
+# Heatmaps for MZ only
+wp_uni_heatmap_mz <- make_wp_heatmap(ag_wp_uni_group_results_mz, NULL)
+
+if (!is.null(wp_uni_heatmap_mz)) print(wp_uni_heatmap_mz)
+
+if (!is.null(wp_uni_heatmap_mz)) {
+  dir.create(file.path(output_multimorbidity_core_dir, "ag", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  ggplot2::ggsave(filename = file.path(output_multimorbidity_core_dir, "ag", "within_pair", "ag_full_withinpair_mz_hr_heatmap.svg"), plot = wp_uni_heatmap_mz, width = 10, height = 8, dpi = 300)
+}
+```
+
+```{r ag_forest_tables_withinpair_mz}
+# AG within-pair (MZ)
+if (exists("ag_wp_uni_group_results_mz") && nrow(ag_wp_uni_group_results_mz) > 0) {
+  dir.create(file.path(output_multimorbidity_core_dir, "ag", "within_pair"), recursive = TRUE, showWarnings = FALSE)
+  out_keys <- unique(ag_wp_uni_group_results_mz$group_display)
+  purrr::walk(out_keys, function(lbl) {
+    df <- ag_wp_uni_group_results_mz |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(Organ_Display = clean_organ_display(organ_age))
+    p <- make_bw_forest_table(df, organ_col = "Organ_Display", eff_col = "hr", low_col = "ci_low", high_col = "ci_high", fdr_col = "fdr", title = lbl, axis_label = "Hazard Ratio (95% CI)")
+    if (!is.null(p)) {
+      fn <- paste0("ag_forest_", stringr::str_replace_all(tolower(lbl), " ", "_"), "_mz_twins.svg")
+      ggplot2::ggsave(filename = fn, plot = p, path = file.path(output_multimorbidity_core_dir, "ag", "within_pair"), device = "svg", width = 7, height = 5, dpi = 300)
+    }
+  })
+  
+  # Create CSV tables directory
+  csv_dir <- file.path(output_multimorbidity_core_dir, "ag", "within_pair", "tables")
+  dir.create(csv_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save CSV for MZ twins
+  purrr::walk(out_keys, function(lbl) {
+    csv_data <- ag_wp_uni_group_results_mz |>
+      dplyr::filter(group_display == lbl) |>
+      dplyr::mutate(
+        use_sci = pmax(abs(hr), abs(ci_low), abs(ci_high), na.rm = TRUE) >= 10,
+        use_sci = if_else(is.na(use_sci), FALSE, use_sci),
+        hr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", hr, ci_low, ci_high),
+          sprintf("%.2f (%.2f-%.2f)", hr, ci_low, ci_high)),
+        Organ_Display = clean_organ_display(organ_age)
+      ) |>
+      dplyr::select(Organ = Organ_Display, `Effect (95% CI)` = hr_formatted, FDR = fdr)
+    
+    if (nrow(csv_data) > 0) {
+      fn <- paste0("ag_", stringr::str_replace_all(tolower(lbl), " ", "_"), "_mz_twins.csv")
+      write.csv(csv_data, file = file.path(csv_dir, fn), row.names = FALSE)
+    }
+  })
+}
+```
+
+# Mean Cumulative Function by Aging Group
+
+```{r mcf_by_extreme_ager, echo=TRUE}
+# Parameters
+extreme_csv_path <- input_extreme_organ_file
+extreme_definition <- "n_aged >= 1"  # e.g., "n_aged >= 1", "n_extreme >= 2"
+use_all_diseases <- TRUE             # TRUE = use any incident disease (uses existing ag_df)
+# Set to FALSE to restrict to a specific disease grouping
+group_labels <- NULL                 # e.g., cvd_multimorbidity (character vector of labels)
+
+# Ensure AG data is available
+if (!exists("ag_df")) {
+  twins_fu <- twins |>
+    dplyr::select(twin_id, age, sex, time_to_death, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp) |>
+    dplyr::mutate(person_years = time_to_death / 365.25, sex = as.factor(sex)) |>
+    dplyr::left_join(
+      composite_diseases |> janitor::clean_names() |> dplyr::select(twin_id, prevalent_mm),
+      by = "twin_id"
+    ) |>
+    dplyr::mutate(prevalent_mm = dplyr::coalesce(prevalent_mm, 0))
+
+  events_any <- timeline |>
+    dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+    dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+    dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+    dplyr::arrange(twin_id, event_time) |>
+    dplyr::group_by(twin_id) |>
+    dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+    dplyr::ungroup()
+
+  censor_any <- twins_fu |>
+    dplyr::select(twin_id, person_years) |>
+    dplyr::left_join(
+      events_any |>
+        dplyr::group_by(twin_id) |>
+        dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"),
+      by = "twin_id"
+    ) |>
+    dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+    dplyr::select(twin_id, start, stop, event)
+
+  ag_df <- dplyr::bind_rows(
+    events_any |> dplyr::select(twin_id, start, stop, event),
+    censor_any
+  ) |>
+    dplyr::filter(stop > start, is.finite(stop)) |>
+    dplyr::left_join(twins_fu |> dplyr::select(twin_id, age, sex, prevalent_mm, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp), by = "twin_id")
+}
+
+# Optionally restrict to one disease grouping
+if (!use_all_diseases) {
+  stopifnot(!is.null(group_labels), exists("label_col"))
+  events_g <- timeline |>
+    dplyr::filter(.data[[label_col]] %in% group_labels) |>
+    dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+    dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+    dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+    dplyr::arrange(twin_id, event_time) |>
+    dplyr::group_by(twin_id) |>
+    dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+    dplyr::ungroup()
+
+  censor_g <- ag_df |>
+    dplyr::group_by(twin_id) |>
+    dplyr::summarise(person_years = max(stop, na.rm = TRUE), .groups = "drop") |>
+    dplyr::left_join(
+      events_g |>
+        dplyr::group_by(twin_id) |>
+        dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"),
+      by = "twin_id"
+    ) |>
+    dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+    dplyr::select(twin_id, start, stop, event)
+
+  ag_df <- dplyr::bind_rows(
+    events_g |> dplyr::select(twin_id, start, stop, event),
+    censor_g
+  ) |>
+    dplyr::filter(stop > start, is.finite(stop)) |>
+    dplyr::left_join(ag_df |> dplyr::select(twin_id, age, sex, prevalent_mm, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp) |> dplyr::distinct(), by = "twin_id")
+}
+
+# Load extreme-ager flags
+extreme_organs <- readr::read_csv(extreme_csv_path, show_col_types = FALSE)
+
+# Define baseline aging groups
+extreme_with_flags <- extreme_organs |>
+  dplyr::mutate(
+    extreme_aged = !! rlang::parse_expr(extreme_definition),
+    extreme_young = n_young >= 1
+  ) |>
+  dplyr::select(twin_id, extreme_aged, extreme_young)
+
+ag_df_strat <- ag_df |>
+  dplyr::left_join(extreme_with_flags, by = "twin_id") |>
+  dplyr::mutate(
+    extreme_aged = dplyr::coalesce(extreme_aged, FALSE),
+    extreme_young = dplyr::coalesce(extreme_young, FALSE),
+    # Create 3-level grouping
+    aging_group = dplyr::case_when(
+      extreme_aged ~ "Extreme aged",
+      extreme_young ~ "Extreme young", 
+      TRUE ~ "Normal"
+    )
+  )
+
+# Mean Cumulative Function (nonparametric)
+compute_mcf <- function(df) {
+  ev <- df |>
+    dplyr::filter(event == 1L) |>
+    dplyr::select(time = stop)
+
+  if (nrow(ev) == 0) return(tibble::tibble(time = numeric(), mcf = numeric()))
+  t_unique <- sort(unique(ev$time))
+
+  # Risk set at time t: intervals covering t
+  at_risk <- vapply(
+    t_unique,
+    function(t) sum(df$start < t & df$stop >= t),
+    numeric(1)
+  )
+  d_t <- vapply(
+    t_unique,
+    function(t) sum(ev$time == t),
+    numeric(1)
+  )
+  incr <- ifelse(at_risk > 0, d_t / at_risk, 0)
+  tibble::tibble(time = t_unique, mcf = cumsum(incr))
+}
+
+# MCF with confidence intervals using Greenwood-like variance
+compute_mcf_with_ci <- function(df) {
+  ev <- df |>
+    dplyr::filter(event == 1L) |>
+    dplyr::select(time = stop)
+
+  if (nrow(ev) == 0) return(tibble::tibble(time = numeric(), mcf = numeric(), ci_low = numeric(), ci_high = numeric()))
+  t_unique <- sort(unique(ev$time))
+
+  at_risk <- vapply(
+    t_unique,
+    function(t) sum(df$start < t & df$stop >= t),
+    numeric(1)
+  )
+  d_t <- vapply(
+    t_unique,
+    function(t) sum(ev$time == t),
+    numeric(1)
+  )
+  incr <- ifelse(at_risk > 0, d_t / at_risk, 0)
+  
+  # Variance estimate (Greenwood-like)
+  var_incr <- ifelse(at_risk > 1, d_t / (at_risk * (at_risk - 1)), 0)
+  cumvar <- cumsum(var_incr)
+  se <- sqrt(cumvar)
+  
+  mcf_vals <- cumsum(incr)
+  tibble::tibble(
+    time = t_unique, 
+    mcf = mcf_vals,
+    ci_low = pmax(0, mcf_vals - 1.96 * se),
+    ci_high = mcf_vals + 1.96 * se
+  )
+}
+
+mcf_by_stratum <- ag_df_strat |>
+  dplyr::group_split(aging_group) |>
+  purrr::map_dfr(function(g) {
+    est <- compute_mcf(g)
+    if (nrow(est) == 0) return(tibble::tibble())
+    est |>
+      dplyr::mutate(aging_group = unique(g$aging_group))
+  })
+
+# Plot
+mcf_plot <- mcf_by_stratum |>
+  ggplot2::ggplot(ggplot2::aes(x = time, y = mcf, color = aging_group)) +
+  ggplot2::geom_step(linewidth = 1) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Extreme aged" = "#D6604D", 
+      "Extreme young" = "#2166AC", 
+      "Normal" = "#2E8B57"
+    ),
+    breaks = c("Extreme young", "Normal", "Extreme aged")
+  ) +
+  ggplot2::labs(x = "Years since baseline", y = "Mean cumulative count", color = NULL) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(legend.position = "bottom", panel.grid.minor = ggplot2::element_blank())
+
+mcf_plot
+
+
+```
+
+# Organ-Specific MCF
+
+```{r flexible_mcf_analysis, echo=TRUE}
+# Parameters for flexible analysis
+target_organ <- "Brain"  # e.g., "Brain", "Heart", "Liver", "Lung", etc. (capitalized)
+target_disease_group <- "neuropsychiatric_multimorbidity"  # or NULL for all diseases
+extreme_definition_young <- paste0("young_", target_organ, " == 1")
+extreme_definition_aged <- paste0("aged_", target_organ, " == 1")
+
+# Load extreme-ager flags for specific organ
+extreme_organs_specific <- extreme_organs |>
+  dplyr::mutate(
+    extreme_young_specific = !! rlang::parse_expr(extreme_definition_young),
+    extreme_aged_specific = !! rlang::parse_expr(extreme_definition_aged)
+  ) |>
+  dplyr::select(twin_id, extreme_young_specific, extreme_aged_specific)
+
+# Build AG data for specific disease group if specified
+if (!is.null(target_disease_group)) {
+  # Use existing disease grouping vectors
+  disease_labels <- group_vectors[[target_disease_group]]
+  
+  events_specific <- timeline |>
+    dplyr::filter(.data[[label_col]] %in% disease_labels) |>
+    dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+    dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+    dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+    dplyr::arrange(twin_id, event_time) |>
+    dplyr::group_by(twin_id) |>
+    dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+    dplyr::ungroup()
+
+  censor_specific <- ag_df |>
+    dplyr::group_by(twin_id) |>
+    dplyr::summarise(person_years = max(stop, na.rm = TRUE), .groups = "drop") |>
+    dplyr::left_join(
+      events_specific |>
+        dplyr::group_by(twin_id) |>
+        dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"),
+      by = "twin_id"
+    ) |>
+    dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+    dplyr::select(twin_id, start, stop, event)
+
+  ag_df_specific <- dplyr::bind_rows(
+    events_specific |> dplyr::select(twin_id, start, stop, event),
+    censor_specific
+  ) |>
+    dplyr::filter(stop > start, is.finite(stop)) |>
+    dplyr::left_join(ag_df |> dplyr::select(twin_id, age, sex, prevalent_mm, edyrs, eversmok, bmi, hba1c, total_hdl_ratio, crp) |> dplyr::distinct(), by = "twin_id")
+} else {
+  # Use all diseases
+  ag_df_specific <- ag_df
+}
+
+# Create organ-specific aging groups
+ag_df_specific_strat <- ag_df_specific |>
+  dplyr::left_join(extreme_organs_specific, by = "twin_id") |>
+  dplyr::mutate(
+    extreme_young_specific = dplyr::coalesce(extreme_young_specific, FALSE),
+    extreme_aged_specific = dplyr::coalesce(extreme_aged_specific, FALSE),
+    # Create 3-level grouping for specific organ
+    aging_group_specific = dplyr::case_when(
+      extreme_aged_specific ~ "Extremely aged",
+      extreme_young_specific ~ "Extremely young", 
+      TRUE ~ "Normal"
+    )
+  )
+
+# Compute MCF with confidence intervals for specific organ and disease group
+mcf_specific <- ag_df_specific_strat |>
+  dplyr::group_split(aging_group_specific) |>
+  purrr::map_dfr(function(g) {
+    est <- compute_mcf_with_ci(g)
+    if (nrow(est) == 0) return(tibble::tibble())
+    est |>
+      dplyr::mutate(aging_group_specific = unique(g$aging_group_specific))
+  })
+
+# Create color mapping dynamically
+aged_label <- paste0("Extreme aged (", target_organ, ")")
+young_label <- paste0("Extreme young (", target_organ, ")")
+
+color_mapping <- c(
+  "Extremely aged" = "#D6604D",  # red for aged
+  "Extremely young" = "#2166AC", # blue for young  
+  "Normal" = "#2E8B57"           # green for normal
+)
+
+# Plot specific analysis with confidence intervals
+mcf_specific_plot <- mcf_specific |>
+  ggplot2::ggplot(ggplot2::aes(x = time, y = mcf, color = aging_group_specific)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = ci_low, ymax = ci_high, fill = aging_group_specific), 
+                       alpha = 0.2, color = NA) +
+  ggplot2::geom_step(linewidth = 1) +
+  ggplot2::scale_color_manual(
+    values = color_mapping,
+    breaks = c("Extremely young", "Normal", "Extremely aged")
+  ) +
+  ggplot2::scale_fill_manual(
+    values = color_mapping,
+    breaks = c("Extremely young", "Normal", "Extremely aged")
+  ) +
+  ggplot2::scale_y_continuous(limits = c(0, NA), expand = ggplot2::expansion(mult = c(0, 0.1))) +
+  ggplot2::labs(
+    x = "Years since baseline", 
+    y = "Mean cumulative count", 
+    color = NULL,
+    fill = NULL,
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    legend.position = "bottom", 
+    panel.grid.minor = ggplot2::element_blank(),
+    legend.text = ggplot2::element_text(size = 9),
+    plot.margin = ggplot2::margin(t = 5, r = 5, b = 35, l = 5, unit = "pt")
+  )
+
+mcf_specific_plot
+
+# Age distribution for specific analysis
+age_summary_specific <- ag_df_specific_strat |>
+  dplyr::group_by(aging_group_specific) |>
+  dplyr::summarise(
+    n_people = n_distinct(twin_id),
+    mean_age = mean(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# Save specific analysis
+dir.create(file.path(output_multimorbidity_core_dir, "other"), recursive = TRUE, showWarnings = FALSE)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       paste0("mcf_", tolower(target_organ), "_", target_disease_group, ".pdf")),
+  plot = mcf_specific_plot, width = 5, height = 5, dpi = 300
+)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       paste0("mcf_", tolower(target_organ), "_", target_disease_group, ".png")),
+  plot = mcf_specific_plot, width = 5, height = 5, dpi = 400
+)
+```
+
+# Granular MCF
+```{r granular_mcf_analysis, echo=TRUE}
+# Create granular aging groups based on number of extreme organs
+ag_df_granular <- ag_df |>
+  dplyr::left_join(extreme_organs, by = "twin_id") |>
+  dplyr::mutate(
+    # Handle missing values
+    n_aged = dplyr::coalesce(n_aged, 0),
+    n_young = dplyr::coalesce(n_young, 0),
+    n_extreme = dplyr::coalesce(n_extreme, 0),
+    
+    # Create granular aging groups
+    aging_group_granular = dplyr::case_when(
+      n_aged >= 6 ~ "6+ aged organs",
+      n_aged >= 5 ~ "5 aged organs", 
+      n_aged >= 4 ~ "4 aged organs",
+      n_aged >= 3 ~ "3 aged organs",
+      n_aged >= 2 ~ "2 aged organs",
+      n_aged >= 1 ~ "1 aged organ",
+      n_young >= 6 ~ "6+ young organs",
+      n_young >= 5 ~ "5 young organs",
+      n_young >= 4 ~ "4 young organs", 
+      n_young >= 3 ~ "3 young organs",
+      n_young >= 2 ~ "2 young organs",
+      n_young >= 1 ~ "1 young organ",
+      TRUE ~ "Normal (0 extreme)"
+    ),
+    
+    # Create simplified groups for plotting
+    aging_group_simple = dplyr::case_when(
+      n_aged >= 2 ~ "2+ aged organs",
+      n_aged == 1 ~ "1 aged organ",
+      n_young >= 1 ~ "Young",
+      TRUE ~ "Normal"
+    ),
+    aging_group_simple = factor(
+      aging_group_simple,
+      levels = c("Young", "Normal", "1 aged organ", "2+ aged organs")
+    )
+  )
+
+# Compute MCF for granular analysis with confidence intervals
+mcf_granular_ci <- ag_df_granular |>
+  dplyr::group_split(aging_group_simple) |>
+  purrr::map_dfr(function(g) {
+    est <- compute_mcf_with_ci(g)
+    if (nrow(est) == 0) return(tibble::tibble())
+    est |>
+      dplyr::mutate(aging_group_simple = unique(g$aging_group_simple))
+  })
+
+# Define color palette for granular groups
+granular_colors <- c(
+  "Normal" = "#2E8B57",            # Green (healthiest)
+  "Young" = "#4169E1",             # Blue (young)
+  "1 aged organ" = "#FFA500",      # Orange (mild aging)
+  "2+ aged organs" = "#DC143C"     # Crimson (severe aging)
+)
+
+# Plot granular MCF with confidence intervals
+mcf_granular_plot <- mcf_granular_ci |>
+  ggplot2::ggplot(ggplot2::aes(x = time, y = mcf, color = aging_group_simple)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = ci_low, ymax = ci_high, fill = aging_group_simple), 
+                       alpha = 0.2, color = NA) +
+  ggplot2::geom_step(linewidth = 1) +
+  ggplot2::scale_color_manual(
+    values = granular_colors,
+    breaks = c("Young", "Normal", "1 aged organ", "2+ aged organs")
+  ) +
+  ggplot2::scale_fill_manual(
+    values = granular_colors,
+    breaks = c("Young", "Normal", "1 aged organ", "2+ aged organs")
+  ) +
+  ggplot2::scale_y_continuous(limits = c(0, NA), expand = ggplot2::expansion(mult = c(0, 0.1))) +
+  ggplot2::labs(
+    x = "Years since baseline", 
+    y = "Mean cumulative count",
+    color = NULL,
+    fill = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    legend.position = "bottom", 
+    panel.grid.minor = ggplot2::element_blank(),
+    legend.text = ggplot2::element_text(size = 9),
+    plot.margin = ggplot2::margin(t = 5, r = 5, b = 35, l = 5, unit = "pt")
+  ) +
+  ggplot2::guides(
+    color = ggplot2::guide_legend(nrow = 2, byrow = TRUE),
+    fill = ggplot2::guide_legend(nrow = 2, byrow = TRUE)
+  )
+
+mcf_granular_plot
+
+# Summary statistics for granular groups
+granular_summary <- ag_df_granular |>
+  dplyr::group_by(aging_group_simple) |>
+  dplyr::summarise(
+    n_people = n_distinct(twin_id),
+    mean_age = mean(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    mean_n_aged = mean(n_aged, na.rm = TRUE),
+    mean_n_young = mean(n_young, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(desc(mean_n_aged), mean_n_young)
+
+
+# Save granular analysis
+dir.create(file.path(output_multimorbidity_core_dir, "other"), recursive = TRUE, showWarnings = FALSE)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", "mcf_granular_organ_aging.pdf"),
+  plot = mcf_granular_plot, width = 5, height = 5, dpi = 300
+)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", "mcf_granular_organ_aging.png"),
+  plot = mcf_granular_plot, width = 5, height = 5, dpi = 400
+)
+```
+
+# Kaplan-Meier: Granular Aging Patterns
+```{r km_granular_organ_aging, echo=TRUE}
+# Create survival dataset with death indicator and aging groups
+km_survival_data <- twins |>
+  dplyr::select(twin_id, deathdate, checkdate, birthdate, time_to_death) |>
+  dplyr::mutate(
+    deceased = dplyr::if_else(!is.na(deathdate), 1, 0),
+    person_years = time_to_death / 365.25
+  ) |>
+  dplyr::left_join(extreme_organs, by = "twin_id") |>
+  dplyr::mutate(
+    n_aged = dplyr::coalesce(n_aged, 0),
+    n_young = dplyr::coalesce(n_young, 0),
+    aging_group_simple = dplyr::case_when(
+      n_aged >= 2 ~ "2+ aged organs",
+      n_aged == 1 ~ "1 aged organ",
+      n_young >= 1 ~ "Young",
+      TRUE ~ "Normal"
+    ),
+    aging_group_simple = factor(
+      aging_group_simple, 
+      levels = c("Young", "Normal", "1 aged organ", "2+ aged organs")
+    )
+  ) |>
+  dplyr::filter(!is.na(person_years), person_years > 0)
+
+# Fit Kaplan-Meier model
+km_fit <- survival::survfit(
+  survival::Surv(time = person_years, event = deceased) ~ aging_group_simple,
+  data = km_survival_data
+)
+
+# Define color palette
+km_colors <- c(
+  "Normal" = "#2E8B57",            # Green (healthiest)
+  "Young" = "#4169E1",             # Blue (young)
+  "1 aged organ" = "#E53935",      # Light red (mild aging)
+  "2+ aged organs" = "#B71C1C"     # Dark red (severe aging)
+)
+
+# Extract survival data from survfit object for ggplot2
+km_data_plot <- broom::tidy(km_fit) |>
+  dplyr::mutate(
+    aging_group_simple = factor(
+      stringr::str_remove(strata, "aging_group_simple="),
+      levels = c("Young", "Normal", "1 aged organ", "2+ aged organs")
+    )
+  )
+
+# Create survival plot with ggplot2
+km_plot <- km_data_plot |>
+  ggplot2::ggplot(ggplot2::aes(x = time, y = estimate, color = aging_group_simple)) +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(ymin = conf.low, ymax = conf.high, fill = aging_group_simple), 
+    alpha = 0.1, 
+    color = NA
+  ) +
+  ggplot2::geom_step(linewidth = 1.5) +
+  ggplot2::scale_x_continuous(limits = c(0, 22), breaks = seq(0, 20, 5)) +
+  ggplot2::scale_y_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, 0.02))) +
+  ggplot2::scale_color_manual(
+    values = km_colors,
+    breaks = c("Young", "Normal", "1 aged organ", "2+ aged organs"),
+    name = "Organ aging"
+  ) +
+  ggplot2::scale_fill_manual(
+    values = km_colors,
+    breaks = c("Young", "Normal", "1 aged organ", "2+ aged organs"),
+    name = "Organ aging"
+  ) +
+  ggplot2::labs(
+    x = "Years since baseline", 
+    y = "Survival probability"
+  ) +
+  ggplot2::theme_minimal(base_size = 16) +
+  ggplot2::theme(
+    legend.position = c(0.02, 0.02),
+    legend.justification = c(0, 0),
+    legend.background = ggplot2::element_rect(fill = scales::alpha("white", 0.8), color = NA),
+    legend.box.margin = ggplot2::margin(5, 5, 5, 5),
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.background = ggplot2::element_rect(fill = "white", color = NA),
+    axis.title.y = ggplot2::element_text(size = 16, face = "plain"),
+    axis.title.x = ggplot2::element_text(size = 16, face = "plain"),
+    axis.text = ggplot2::element_text(size = 14),
+    legend.text = ggplot2::element_text(size = 12),
+    legend.title = ggplot2::element_text(size = 14, face = "plain")
+  )
+
+print(km_plot)
+
+# Summary statistics
+km_summary_stats <- km_survival_data |>
+  dplyr::group_by(aging_group_simple) |>
+  dplyr::summarise(
+    n_individuals = n(),
+    n_deaths = sum(deceased),
+    death_rate = round(sum(deceased) / n() * 100, 1),
+    mean_followup = round(mean(person_years, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+# Log-rank test
+km_logrank <- survival::survdiff(
+  survival::Surv(time = person_years, event = deceased) ~ aging_group_simple,
+  data = km_survival_data
+)
+
+# Extract median survival times
+km_median_survival <- summary(km_fit)$table |>
+  as.data.frame() |>
+  tibble::rownames_to_column("group") |>
+  dplyr::mutate(
+    group = stringr::str_remove(group, "aging_group_simple=")
+  ) |>
+  dplyr::select(group, median, `0.95LCL`, `0.95UCL`)
+# Save KM plot
+dir.create(file.path(output_multimorbidity_core_dir, "other"), 
+           recursive = TRUE, showWarnings = FALSE)
+
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       "km_granular_organ_aging.pdf"),
+  plot = km_plot,
+  width = 5,
+  height = 5,
+  dpi = 300
+)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", 
+                       "km_granular_organ_aging.png"),
+  plot = km_plot,
+  width = 5,
+  height = 5,
+  dpi = 400
+)
+```
+
+# GI Aging vs Digestive Disease
+```{r gi_aging_digestive, echo=TRUE}
+# Parameters for GI aging vs. digestive diseases
+target_organ <- "Gastrointestinal Tract"  # Note: capitalized as in the data
+target_disease_group <- "digestive_multimorbidity"
+
+# Load extreme-ager flags for GI tract
+extreme_organs_gi <- extreme_organs |>
+  dplyr::mutate(
+    extreme_young_gi = young_Gastrointestinal == 1,
+    extreme_aged_gi = aged_Gastrointestinal == 1
+  ) |>
+  dplyr::select(twin_id, extreme_young_gi, extreme_aged_gi)
+
+# Build AG data for digestive diseases
+disease_labels <- group_vectors[[target_disease_group]]
+
+events_gi <- timeline |>
+  dplyr::filter(.data[[label_col]] %in% disease_labels) |>
+  dplyr::select(twin_id, earliest_date, checkdate, has_disease, prevalent) |>
+  dplyr::filter(has_disease == 1, prevalent == 0, earliest_date > checkdate) |>
+  dplyr::mutate(event_time = as.numeric(earliest_date - checkdate) / 365.25) |>
+  dplyr::arrange(twin_id, event_time) |>
+  dplyr::group_by(twin_id) |>
+  dplyr::mutate(start = dplyr::lag(event_time, default = 0), stop = event_time, event = 1L) |>
+  dplyr::ungroup()
+
+censor_gi <- ag_df |>
+  dplyr::group_by(twin_id) |>
+  dplyr::summarise(person_years = max(stop, na.rm = TRUE), .groups = "drop") |>
+  dplyr::left_join(
+    events_gi |>
+      dplyr::group_by(twin_id) |>
+      dplyr::summarise(last_stop = max(stop, na.rm = TRUE), .groups = "drop"),
+    by = "twin_id"
+  ) |>
+  dplyr::mutate(start = dplyr::coalesce(last_stop, 0), stop = pmax(person_years, start), event = 0L) |>
+  dplyr::select(twin_id, start, stop, event)
+
+ag_df_gi <- dplyr::bind_rows(
+  events_gi |> dplyr::select(twin_id, start, stop, event),
+  censor_gi
+) |>
+  dplyr::filter(stop > start, is.finite(stop)) |>
+  dplyr::left_join(ag_df |> dplyr::select(twin_id, age, sex, prevalent_mm) |> dplyr::distinct(), by = "twin_id")
+
+# Create GI-specific aging groups
+ag_df_gi_strat <- ag_df_gi |>
+  dplyr::left_join(extreme_organs_gi, by = "twin_id") |>
+  dplyr::mutate(
+    extreme_young_gi = dplyr::coalesce(extreme_young_gi, FALSE),
+    extreme_aged_gi = dplyr::coalesce(extreme_aged_gi, FALSE),
+    # Create 3-level grouping for GI tract
+    aging_group_gi = dplyr::case_when(
+      extreme_aged_gi ~ "Extremely aged",
+      extreme_young_gi ~ "Extremely young", 
+      TRUE ~ "Normal"
+    )
+  )
+
+# Compute MCF for GI aging and digestive diseases
+mcf_gi <- ag_df_gi_strat |>
+  dplyr::group_split(aging_group_gi) |>
+  purrr::map_dfr(function(g) {
+    est <- compute_mcf_with_ci(g)
+    if (nrow(est) == 0) return(tibble::tibble())
+    est |>
+      dplyr::mutate(aging_group_gi = unique(g$aging_group_gi))
+  })
+
+# Create color mapping for GI analysis
+gi_colors <- c(
+  "Extremely aged" = "#D6604D", 
+  "Extremely young" = "#2166AC", 
+  "Normal" = "#2E8B57"
+)
+
+# Plot GI aging vs. digestive diseases
+mcf_gi_plot <- mcf_gi |>
+  ggplot2::ggplot(ggplot2::aes(x = time, y = mcf, color = aging_group_gi)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = ci_low, ymax = ci_high, fill = aging_group_gi), 
+                       alpha = 0.2, color = NA) +
+  ggplot2::geom_step(linewidth = 1) +
+  ggplot2::scale_color_manual(
+    values = gi_colors,
+    breaks = c("Extremely young", "Normal", "Extremely aged")
+  ) +
+  ggplot2::scale_fill_manual(
+    values = gi_colors,
+    breaks = c("Extremely young", "Normal", "Extremely aged")
+  ) +
+  ggplot2::scale_y_continuous(limits = c(0, NA), expand = ggplot2::expansion(mult = c(0, 0.1))) +
+  ggplot2::labs(
+    x = "Years since baseline", 
+    y = "Mean cumulative count",
+    color = NULL,
+    fill = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 13) +
+  ggplot2::theme(
+    legend.position = "bottom", 
+    panel.grid.minor = ggplot2::element_blank(),
+    legend.text = ggplot2::element_text(size = 9),
+    plot.margin = ggplot2::margin(t = 5, r = 5, b = 35, l = 5, unit = "pt")
+  ) +
+  ggplot2::guides(
+    color = ggplot2::guide_legend(nrow = 2, byrow = TRUE),
+    fill = ggplot2::guide_legend(nrow = 2, byrow = TRUE)
+  )
+
+mcf_gi_plot
+
+# Age distribution for GI analysis
+age_summary_gi <- ag_df_gi_strat |>
+  dplyr::group_by(aging_group_gi) |>
+  dplyr::summarise(
+    n_people = n_distinct(twin_id),
+    mean_age = mean(age, na.rm = TRUE),
+    median_age = median(age, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# Save GI analysis
+dir.create(file.path(output_multimorbidity_core_dir, "other"), recursive = TRUE, showWarnings = FALSE)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", "mcf_gi_aging_digestive.pdf"),
+  plot = mcf_gi_plot, width = 5, height = 5, dpi = 300
+)
+ggplot2::ggsave(
+  filename = file.path(output_multimorbidity_core_dir, "other", "mcf_gi_aging_digestive.png"),
+  plot = mcf_gi_plot, width = 5, height = 5, dpi = 400
+)
+```
+

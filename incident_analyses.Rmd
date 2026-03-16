@@ -1,0 +1,2867 @@
+---
+title: "Incident outcome analyses"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries}
+library(tidyverse)
+library(survival)
+library(survminer)
+library(haven)
+library(readxl)
+library(ggvenn)
+library(patchwork)
+library(lubridate)
+library(lmtest)
+library(sandwich)
+select = dplyr::select
+rename = dplyr::rename
+slice = dplyr::slice
+desc = dplyr::desc
+```
+
+# 1. Data Preparation
+
+## 1.1 Load and Process Datasets
+
+```{r data_loading}
+# Input files (set these for your environment)
+input_diagnosis_file <- "PATH/TO/input_diagnosis.csv"
+input_cancer_file <- "PATH/TO/input_cancer.csv"
+input_metadata_file <- "PATH/TO/input_metadata.csv"
+input_organ_age_file <- "PATH/TO/input_organ_age.csv"
+
+# Output root (set this for your environment)
+output_core_dir <- "PATH/TO/output/core_cox"
+
+# Core schema configuration
+id_col <- "twin_id"
+sex_col <- "sex"
+pair_col <- "pair_id"
+male_code <- 1
+female_code <- 2
+
+# Optional organ-specific columns (set to NULL if not present)
+ovary_col <- "Ovary"
+prostate_col <- "Prostate"
+
+# Optional prefix to remove from organ-age columns
+organ_age_prefix_to_strip <- "tuned_mortality_"
+
+# Covariate sets (choose active set)
+covariate_sets <- list(
+  minimal = c("sex", "age"),
+  cardiometabolic = c("sex", "age", "bmi"),
+  extended = c("sex", "age", "edyrs", "eversmok", "bmi", "hba1c", "total_hdl_ratio", "crp")
+)
+active_covariate_set <- "extended"
+
+active_covariates <- covariate_sets[[active_covariate_set]]
+if (is.null(active_covariates)) {
+  stop("Invalid `active_covariate_set` in data_loading.")
+}
+covariate_formula_terms <- paste(active_covariates, collapse = " + ")
+
+# Load datasets
+composite_diseases <- read_csv(input_diagnosis_file) |>
+  # Convert NAs in numeric disease indicator columns to 0 (exclude id)
+  mutate(across(where(is.numeric) & !any_of(id_col), ~ if_else(is.na(.), 0, .)))
+cancer <- read_csv(input_cancer_file)
+twins <- read_csv(input_metadata_file)
+
+organ_age_mortality <- read_csv(input_organ_age_file)
+
+## 1.2 Define Analysis Parameters
+end_followup <- as.Date("2024-03-05")
+
+## 1.3 Process Organ Age Data
+if (!is.null(organ_age_prefix_to_strip) && nzchar(organ_age_prefix_to_strip)) {
+  organ_age_mortality <- organ_age_mortality |>
+    rename_with(~str_remove(., paste0("^", organ_age_prefix_to_strip)), everything())
+}
+
+## 1.4 Process Organ Ages Based on Sex
+organ_age_mortality <- organ_age_mortality |>
+  left_join(select(twins, all_of(c(id_col, sex_col))), by = id_col)
+
+if (!is.null(ovary_col) && ovary_col %in% names(organ_age_mortality)) {
+  organ_age_mortality <- organ_age_mortality |>
+    mutate("{ovary_col}" := if_else(.data[[sex_col]] == male_code, NA_real_, .data[[ovary_col]]))
+}
+
+if (!is.null(prostate_col) && prostate_col %in% names(organ_age_mortality)) {
+  organ_age_mortality <- organ_age_mortality |>
+    mutate("{prostate_col}" := if_else(.data[[sex_col]] == female_code, NA_real_, .data[[prostate_col]]))
+}
+
+organ_age_mortality <- organ_age_mortality |>
+  select(-all_of(sex_col))
+
+## 1.5 Merge Main Datasets
+twins_analysis <- twins |>
+  left_join(composite_diseases, by = id_col) |>
+  left_join(cancer, by = id_col) |> 
+  mutate(
+    across(ends_with("_date"), as.Date),
+    birthdate = as.Date(birthdate),
+    checkdate = as.Date(checkdate),
+    deathdate = as.Date(deathdate),
+    sex = as.factor(sex)
+  ) |> 
+  mutate(across(c(cvd, diabetes, dementia, parkinson_and_parkinsonism), ~ if_else(is.na(.), 0, .))) |>
+  # Convert NA to 0 for cancer variables (missing = no cancer)
+  mutate(across(c("Melanoma", "Prostate cancer", "Multiple myeloma", "Brain cancer", 
+                  "Lung cancer", "Breast cancer", "Colorectal cancer", "Kidney cancer", 
+                  "Bladder cancer", "Esophageal cancer", "Stomach cancer", "Liver cancer", 
+                  "Lymphoma", "Leukemia", "Ovarian cancer", "Thyroid cancer", 
+                  "Uterine cancer", "Pancreatic cancer", "Cervical cancer"), 
+                ~ if_else(is.na(.), 0, .))) |> 
+  # Treat missing healthspan_event as censored (0)
+  mutate(healthspan_event = if_else(is.na(healthspan_event), 0, healthspan_event))
+
+## 1.6 Create Analysis Datasets
+twins_mortality <- twins_analysis |>
+  left_join(organ_age_mortality, by = id_col)
+
+## 1.7 Get Organ Age Columns
+organ_age_cols_mortality <- names(organ_age_mortality)[names(organ_age_mortality) != id_col]
+
+```
+
+# 2. Disease Selection and Eligibility
+
+```{r incident_case_filter}
+## 2.1 Define Diseases to Analyze
+# Disease configuration: list_key = list(var = "...", date = "...", name = "...")
+diseases_config <- list(
+  # Metabolic diseases
+  diabetes = list(var = "diabetes", date = "diabetes_date", name = "Diabetes"),
+  
+  # Neurological diseases
+  dementia = list(var = "dementia", date = "dementia_date", name = "Dementia"),
+  parkinsons = list(var = "parkinson_and_parkinsonism", date = "parkinson_and_parkinsonism_date", name = "Parkinson"),
+  
+  # Cardiovascular diseases
+  ischemic_heart_disease = list(var = "ischemic_heart_disease", date = "ischemic_heart_disease_date", name = "Ischemic heart disease"),
+  atrial_fibrillation = list(var = "atrial_fibrillation", date = "atrial_fibrillation_date", name = "Atrial fibrillation"),
+  cerebrovascular_disease = list(var = "cerebrovascular_disease", date = "cerebrovascular_disease_date", name = "Cerebrovascular disease"),
+  heart_failure = list(var = "heart_failure", date = "heart_failure_date", name = "Heart failure"),
+  
+  # Cancer types
+  melanoma = list(var = "Melanoma", date = "Melanoma_date", name = "Melanoma"),
+  prostate_cancer = list(var = "Prostate cancer", date = "Prostate cancer_date", name = "Prostate cancer"),
+  multiple_myeloma = list(var = "Multiple myeloma", date = "Multiple myeloma_date", name = "Multiple myeloma"),
+  brain_cancer = list(var = "Brain cancer", date = "Brain cancer_date", name = "Brain cancer"),
+  lung_cancer = list(var = "Lung cancer", date = "Lung cancer_date", name = "Lung cancer"),
+  breast_cancer = list(var = "Breast cancer", date = "Breast cancer_date", name = "Breast cancer"),
+  colorectal_cancer = list(var = "Colorectal cancer", date = "Colorectal cancer_date", name = "Colorectal cancer"),
+  kidney_cancer = list(var = "Kidney cancer", date = "Kidney cancer_date", name = "Kidney cancer"),
+  bladder_cancer = list(var = "Bladder cancer", date = "Bladder cancer_date", name = "Bladder cancer"),
+  esophageal_cancer = list(var = "Esophageal cancer", date = "Esophageal cancer_date", name = "Esophageal cancer"),
+  stomach_cancer = list(var = "Stomach cancer", date = "Stomach cancer_date", name = "Stomach cancer"),
+  liver_cancer = list(var = "Liver cancer", date = "Liver cancer_date", name = "Liver cancer"),
+  lymphoma = list(var = "Lymphoma", date = "Lymphoma_date", name = "Lymphoma"),
+  leukemia = list(var = "Leukemia", date = "Leukemia_date", name = "Leukemia"),
+  ovarian_cancer = list(var = "Ovarian cancer", date = "Ovarian cancer_date", name = "Ovarian cancer"),
+  thyroid_cancer = list(var = "Thyroid cancer", date = "Thyroid cancer_date", name = "Thyroid cancer"),
+  uterine_cancer = list(var = "Uterine cancer", date = "Uterine cancer_date", name = "Uterine cancer"),
+  pancreatic_cancer = list(var = "Pancreatic cancer", date = "Pancreatic cancer_date", name = "Pancreatic cancer"),
+  cervical_cancer = list(var = "Cervical cancer", date = "Cervical cancer_date", name = "Cervical cancer")
+)
+```
+
+```{r filter_diseases_by_cases}
+## 2.2 Examine Disease Case Counts and Filter Diseases Below Minimum Threshold
+disease_case_counts <- twins_analysis |>
+  summarise(
+    across(
+      map_chr(diseases_config, ~.x$var), 
+      ~sum(. == 1, na.rm = TRUE), 
+      .names = "{.col}_cases"
+    )
+  ) |>
+  pivot_longer(everything(), names_to = "disease", values_to = "cases") |>
+  mutate(
+    disease_clean = str_remove(disease, "_cases"),
+    pct_of_sample = cases / nrow(twins_analysis) * 100
+  )
+
+## 2.3 Calculate Minimum Threshold 
+min_cases_threshold <- round(0.01 * nrow(twins))
+diseases_to_keep <- disease_case_counts |>
+  filter(cases >= min_cases_threshold) |>
+  pull(disease_clean)
+
+## 2.4 Keep Only Diseases That Meet the Minimum Case Threshold
+diseases <- diseases_config[names(diseases_config) %in% diseases_to_keep]
+
+## 2.5 Disease Case Summary
+cat("Disease case counts and filtering summary:\n")
+print(disease_case_counts)
+cat("\nMinimum cases threshold:", min_cases_threshold, "\n")
+cat("Diseases kept for analysis:", paste(names(diseases), collapse = ", "), "\n")
+cat("Diseases excluded:", paste(setdiff(names(diseases_config), names(diseases)), collapse = ", "), "\n")
+
+
+
+## 2.6 Recompute Eligible Diseases Using Incident Cases Only (Exclude Prevalent at Baseline)
+incident_case_counts <- map_dfr(names(diseases_config), function(d) {
+  spec <- diseases_config[[d]]
+  var <- spec$var
+  date_var <- spec$date
+  tibble(
+    disease = d,
+    cases = sum(twins_analysis[[var]] == 1 & twins_analysis[[date_var]] > twins_analysis$checkdate, na.rm = TRUE)
+  )
+})
+
+diseases_to_keep_incident <- incident_case_counts |>
+  filter(cases >= min_cases_threshold) |>
+  pull(disease)
+
+## 2.7 Keep Diseases Meeting Incident-Case Threshold
+diseases <- diseases_config[names(diseases_config) %in% diseases_to_keep_incident]
+```
+
+# 3. Analysis Functions
+
+```{r functions}
+## 3.1 Function to Create Age-Based Time-to-Event Variables
+create_time_to_event_age <- function(data, disease_var, disease_date_var, disease_name) {
+  
+  # Validate disease label
+  if (is.null(disease_name) || length(disease_name) == 0 || disease_name == "") {
+    stop("disease_name is empty or null")
+  }
+  
+  # Filter by sex for sex-specific diseases to restrict at-risk population
+  data_filtered <- data
+  if (grepl("prostate", disease_name, ignore.case = TRUE)) {
+    data_filtered <- data_filtered |> filter(sex == 1)  # Males only
+  } else if (grepl("breast|ovarian|uterine|cervical", disease_name, ignore.case = TRUE)) {
+    data_filtered <- data_filtered |> filter(sex == 2)  # Females only
+  }
+  
+  # Check if disease_date_var is a numeric age variable (like healthspan) or a date
+  # For healthspan, the variable is already an age, not a date
+  is_numeric_age <- disease_date_var == "healthspan"
+  
+  if (is_numeric_age) {
+    # Numeric-age outcome (e.g., healthspan)
+    data_clean <- data_filtered |>
+      mutate(
+        age_at_event = !!sym(disease_date_var),  # Already an age
+        time_to_event = age_at_event - age,
+        event = !!sym(disease_var)
+      ) |>
+      filter(!is.na(time_to_event), time_to_event > 0)
+  } else {
+    # Standard handling for date variables
+    data_clean <- data_filtered |>
+      filter(
+        !!sym(disease_var) == 0 |
+        (!!sym(disease_var) == 1 & !!sym(disease_date_var) > checkdate)
+      ) |>
+      mutate(
+        age_at_event = case_when(
+          !!sym(disease_var) == 1 ~ as.numeric(!!sym(disease_date_var) - birthdate) / 365.25,
+          deceased == 1 & !!sym(disease_var) == 0 & !is.na(deathdate) & deathdate <= end_followup ~ as.numeric(deathdate - birthdate) / 365.25,
+          TRUE ~ as.numeric(end_followup - birthdate) / 365.25
+        ),
+        time_to_event = age_at_event - age,
+        event = case_when(
+          !!sym(disease_var) == 1 ~ 1,
+          TRUE ~ 0
+        )
+      ) |>
+      filter(time_to_event > 0)
+  }
+  
+  n_original <- nrow(data_filtered)
+  n_events <- sum(data_clean$event, na.rm = TRUE)
+  n_censored_death <- sum(data_clean$deceased == 1 & data_clean$event == 0, na.rm = TRUE)
+  n_censored_followup <- sum(data_clean$deceased == 0 & data_clean$event == 0, na.rm = TRUE)
+  
+  cleaning_summary <- list(
+    disease = disease_name,
+    n_original = n_original,
+    n_prevalent_removed = n_original - nrow(data_clean),
+    n_incident_cases = n_events,
+    n_censored_death = n_censored_death,
+    n_censored_followup = n_censored_followup,
+    n_final = nrow(data_clean)
+  )
+  
+  return(list(data = data_clean, summary = cleaning_summary))
+}
+
+## 3.2 Function to Run Cox Analysis with Organ Ages
+run_organ_age_cox_age <- function(data, disease_var, disease_date_var, disease_name, organ_age_col) {
+  
+  analysis_data <- create_time_to_event_age(data, disease_var, disease_date_var, disease_name)
+  twins_clean <- analysis_data$data
+  
+  surv_obj <- Surv(twins_clean$time_to_event, twins_clean$event)
+  cox_formula <- as.formula(paste("surv_obj ~", covariate_formula_terms, "+", organ_age_col))
+  cox_model <- coxph(cox_formula, data = twins_clean)
+  
+  # Get cluster-robust standard errors
+  cluster_se <- vcovCL(cox_model, cluster = ~pair_id)
+  coeftest_model <- coeftest(cox_model, vcov = cluster_se)
+  
+  return(list(
+    model = cox_model,
+    summary = summary(cox_model),
+    coeftest = coeftest_model,
+    cluster_vcov = cluster_se,
+    cleaning_summary = analysis_data$summary,
+    data = twins_clean,
+    organ_age_col = organ_age_col
+  ))
+}
+
+## 3.3 Function to Run Mortality Cox Analysis
+run_mortality_cox_age <- function(data, organ_age_col) {
+  
+  mortality_data <- data |>
+    mutate(
+      age_at_event = case_when(
+        deceased == 1 & !is.na(deathdate) ~ as.numeric(deathdate - birthdate) / 365.25,
+        TRUE ~ as.numeric(end_followup - birthdate) / 365.25
+      ),
+      time_to_event = age_at_event - age,
+      event = deceased
+    ) |>
+    filter(time_to_event > 0)
+  
+  surv_obj <- Surv(mortality_data$time_to_event, mortality_data$event)
+  cox_formula <- as.formula(paste("surv_obj ~", covariate_formula_terms, "+", organ_age_col))
+  cox_model <- coxph(cox_formula, data = mortality_data)
+  
+  # Get cluster-robust standard errors
+  cluster_se <- vcovCL(cox_model, cluster = ~pair_id)
+  coeftest_model <- coeftest(cox_model, vcov = cluster_se)
+  
+  return(list(
+    model = cox_model,
+    summary = summary(cox_model),
+    coeftest = coeftest_model,
+    cluster_vcov = cluster_se,
+    data = mortality_data,
+    organ_age_col = organ_age_col
+  ))
+}
+
+## 3.4 Function to Run Healthspan Cox Analysis (Age-Based Time Scale)
+run_healthspan_cox_age <- function(data, organ_age_col) {
+  
+  healthspan_data <- data |>
+    mutate(
+      time_to_event = healthspan - age,
+      event = healthspan_event
+    ) |>
+    filter(!is.na(time_to_event), time_to_event > 0)
+  
+  surv_obj <- Surv(healthspan_data$time_to_event, healthspan_data$event)
+  cox_formula <- as.formula(paste("surv_obj ~", covariate_formula_terms, "+", organ_age_col))
+  cox_model <- coxph(cox_formula, data = healthspan_data)
+  
+  # Get cluster-robust standard errors
+  cluster_se <- vcovCL(cox_model, cluster = ~pair_id)
+  coeftest_model <- coeftest(cox_model, vcov = cluster_se)
+  
+  return(list(
+    model = cox_model,
+    summary = summary(cox_model),
+    coeftest = coeftest_model,
+    cluster_vcov = cluster_se,
+    data = healthspan_data,
+    organ_age_col = organ_age_col
+  ))
+}
+
+## 3.6 Function to Extract Results
+extract_organ_age_results <- function(results_list, model_type) {
+  all_results <- list()
+  
+  for (disease_name in names(results_list)) {
+    for (organ_name in names(results_list[[disease_name]])) {
+      result <- results_list[[disease_name]][[organ_name]]
+      
+      if (!is.null(result)) {
+        # Use cluster-robust results
+        coeftest_model <- result$coeftest
+        organ_age_col <- result$organ_age_col
+        
+        # Find the organ age coefficient index (last coefficient)
+        coef_names <- rownames(coeftest_model)
+        organ_idx <- which(coef_names == organ_age_col)
+        
+        if (length(organ_idx) > 0) {
+          # Extract cluster-robust coefficient and standard error
+          coef_est <- coeftest_model[organ_idx, "Estimate"]
+          coef_se <- coeftest_model[organ_idx, "Std. Error"]
+          p_value <- coeftest_model[organ_idx, "Pr(>|z|)"]
+          
+          # Calculate HR and CI from cluster-robust results
+          hr <- exp(coef_est)
+          hr_lower <- exp(coef_est - 1.96 * coef_se)
+          hr_upper <- exp(coef_est + 1.96 * coef_se)
+          
+          all_results[[paste(disease_name, organ_name, sep = "_")]] <- tibble(
+            Disease = disease_name,
+            Organ = organ_name,
+            Model_Type = model_type,
+            HR = hr,
+            HR_lower = hr_lower,
+            HR_upper = hr_upper,
+            P_value = p_value
+          )
+        }
+      }
+    }
+  }
+  
+  return(bind_rows(all_results))
+}
+
+## 3.7 Function to Extract Mortality Results
+extract_mortality_results <- function(results_list, model_type) {
+  all_results <- list()
+  
+  for (organ_name in names(results_list)) {
+    result <- results_list[[organ_name]]
+    
+    if (!is.null(result)) {
+      # Use cluster-robust results
+      coeftest_model <- result$coeftest
+      organ_age_col <- result$organ_age_col
+      
+      # Find the organ age coefficient index (last coefficient)
+      coef_names <- rownames(coeftest_model)
+      organ_idx <- which(coef_names == organ_age_col)
+      
+      if (length(organ_idx) > 0) {
+        # Extract cluster-robust coefficient and standard error
+        coef_est <- coeftest_model[organ_idx, "Estimate"]
+        coef_se <- coeftest_model[organ_idx, "Std. Error"]
+        p_value <- coeftest_model[organ_idx, "Pr(>|z|)"]
+        
+        # Calculate HR and CI from cluster-robust results
+        hr <- exp(coef_est)
+        hr_lower <- exp(coef_est - 1.96 * coef_se)
+        hr_upper <- exp(coef_est + 1.96 * coef_se)
+        
+        all_results[[organ_name]] <- tibble(
+          Disease = "Mortality",
+          Organ = organ_name,
+          Model_Type = model_type,
+          HR = hr,
+          HR_lower = hr_lower,
+          HR_upper = hr_upper,
+          P_value = p_value
+        )
+      }
+    }
+  }
+  
+  return(bind_rows(all_results))
+}
+
+## 3.8 Function to Extract Healthspan Results
+extract_healthspan_results <- function(results_list, model_type) {
+  all_results <- list()
+  
+  for (organ_name in names(results_list)) {
+    result <- results_list[[organ_name]]
+    
+    if (!is.null(result)) {
+      # Use cluster-robust results
+      coeftest_model <- result$coeftest
+      organ_age_col <- result$organ_age_col
+      
+      # Find the organ age coefficient index (last coefficient)
+      coef_names <- rownames(coeftest_model)
+      organ_idx <- which(coef_names == organ_age_col)
+      
+      if (length(organ_idx) > 0) {
+        # Extract cluster-robust coefficient and standard error
+        coef_est <- coeftest_model[organ_idx, "Estimate"]
+        coef_se <- coeftest_model[organ_idx, "Std. Error"]
+        p_value <- coeftest_model[organ_idx, "Pr(>|z|)"]
+        
+        # Calculate HR and CI from cluster-robust results
+        hr <- exp(coef_est)
+        hr_lower <- exp(coef_est - 1.96 * coef_se)
+        hr_upper <- exp(coef_est + 1.96 * coef_se)
+        
+        all_results[[organ_name]] <- tibble(
+          Disease = "Healthspan",
+          Organ = organ_name,
+          Model_Type = model_type,
+          HR = hr,
+          HR_lower = hr_lower,
+          HR_upper = hr_upper,
+          P_value = p_value
+        )
+      }
+    }
+  }
+  
+  return(bind_rows(all_results))
+}
+```
+
+# 4. Cox Regression Analyses
+
+Cox models for incident disease risk.  
+Model: `Surv(time_to_event, event) ~ organ_age + selected_covariates` with pair-clustered robust SEs.
+
+```{r disease_analyses}
+## 4.1 Disease Risk Analyses (All Diseases Including Cancer)
+
+# Diseases list is now defined in the data loading section above
+# This includes both non-cancer and cancer diseases
+
+### 4.1.2 Mortality-Calibrated Organ Age Models for Disease Risk
+mortality_results <- list()
+for (disease_name in names(diseases)) {
+  disease <- diseases[[disease_name]]
+  mortality_results[[disease_name]] <- list()
+  
+  for (organ_col in organ_age_cols_mortality) {
+    # Skip impossible organ-disease combinations
+    # Female-specific diseases: skip Prostate organ
+    if (grepl("breast|ovarian|uterine|cervical", disease$name, ignore.case = TRUE) && organ_col == "Prostate") {
+      next
+    }
+    # Prostate cancer: skip Ovary organ
+    if (grepl("prostate", disease$name, ignore.case = TRUE) && organ_col == "Ovary") {
+      next
+    }
+    
+    result <- run_organ_age_cox_age(
+      data = twins_mortality,
+      disease_var = disease$var,
+      disease_date_var = disease$date,
+      disease_name = disease$name,
+      organ_age_col = organ_col
+    )
+    mortality_results[[disease_name]][[organ_col]] <- result
+  }
+}
+```
+
+## 4.2 Mortality Risk Analyses
+
+Univariate Cox models for all-cause mortality.  
+Model: `Surv(time_to_death, death_event) ~ organ_age + selected_covariates` with pair-clustered robust SEs.
+
+```{r mortality_analyses}
+### 4.2.2 Mortality-Calibrated Organ Age Models for Mortality
+mortality_mortality_results <- list()
+for (organ_col in organ_age_cols_mortality) {
+  result <- run_mortality_cox_age(data = twins_mortality, organ_age_col = organ_col)
+  mortality_mortality_results[[organ_col]] <- result
+}
+
+```
+## 4.3 Healthspan Risk Analyses
+
+Univariate Cox models for healthspan (first major disease or death).  
+Model: `Surv(time_to_first_disease_or_death, event) ~ organ_age + selected_covariates` with pair-clustered robust SEs.
+
+```{r healthspan_analyses}
+### 4.3.1 Mortality-Calibrated Organ Age Models for Healthspan
+
+healthspan_mortality_results <- list()
+for (organ_col in organ_age_cols_mortality) {
+  result <- run_healthspan_cox_age(data = twins_mortality, organ_age_col = organ_col)
+  healthspan_mortality_results[[organ_col]] <- result
+}
+```
+
+## 4.4 Data Cleaning Summary
+
+# 5. Results Compilation and Processing
+
+```{r results_compilation}
+## 5.1 Extract Disease Results (All Diseases Including Cancer)
+mortality_summary <- extract_organ_age_results(mortality_results, "Mortality")
+
+## 5.2 Extract Mortality Results
+mortality_mortality_summary <- extract_mortality_results(mortality_mortality_results, "Mortality")
+
+## 5.3 Extract Healthspan Results
+healthspan_mortality_summary <- extract_healthspan_results(healthspan_mortality_results, "Mortality")
+
+## 5.4 Combine All Results
+all_organ_age_results <- bind_rows(
+  mortality_summary
+) |>
+  group_by(Disease) |>
+  mutate(P_value_FDR = p.adjust(P_value, method = "fdr")) |>
+  ungroup()
+
+all_organ_age_results_with_mortality <- bind_rows(
+  all_organ_age_results,
+  mortality_mortality_summary,
+  healthspan_mortality_summary
+) |>
+  group_by(Disease) |>
+  mutate(P_value_FDR = p.adjust(P_value, method = "fdr")) |>
+  ungroup() |>
+  # Mark impossible organ-disease combinations instead of filtering them out
+  mutate(
+    impossible = case_when(
+      # Female-specific cancers with prostate organ
+      Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate" ~ TRUE,
+      # Prostate cancer with ovary organ
+      Disease == "prostate_cancer" & Organ == "Ovary" ~ TRUE,
+      TRUE ~ FALSE
+    )
+  )
+```
+
+# 6. Visualization: Association Heatmaps
+
+```{r association_heatmaps}
+# Control variables for heatmap appearance
+HEATMAP_TEXT_SIZE <- 14
+HEATMAP_SQUARE_SIZE_DIVISOR <- 12
+
+## 6.1 Create Standardized Ordering for All Plots
+
+# Create dynamic standardized disease ordering based on available diseases
+create_standardized_disease_order <- function(available_diseases = NULL) {
+  # If no diseases provided, use the global diseases object
+  if (is.null(available_diseases)) {
+    available_diseases <- diseases
+  }
+  
+  # Define preferred order for common diseases (using display names)
+  preferred_order <- c(
+    "Mortality", "End of Healthspan",
+    # Cardiovascular diseases
+    "Ischemic heart disease", "Heart failure", "Atrial fibrillation", "Cerebrovascular disease",
+    # Metabolic diseases  
+    "Diabetes",
+    # Neurological diseases
+    "Dementia", "Parkinson",
+    # Cancer (by incidence/importance)
+    "Breast cancer", "Prostate cancer", "Lung cancer", "Colorectal cancer", 
+    "Melanoma", "Bladder cancer", "Kidney cancer", "Pancreatic cancer",
+    "Liver cancer", "Stomach cancer", "Esophageal cancer", "Brain cancer",
+    "Lymphoma", "Leukemia", "Multiple myeloma", "Ovarian cancer", 
+    "Thyroid cancer", "Uterine cancer", "Cervical cancer"
+  )
+  
+  # Get available disease display names
+  available_display_names <- c(
+    "Mortality", "End of Healthspan",
+    map_chr(available_diseases, ~.x$name)
+  )
+  
+  # Apply preferred ordering to available diseases
+  ordered_diseases <- intersect(preferred_order, available_display_names)
+  # Add any diseases not in preferred order at the end
+  missing_diseases <- setdiff(available_display_names, preferred_order)
+  c(ordered_diseases, missing_diseases)
+}
+
+# Define standardized organ ordering (by biological relevance)
+standardized_organ_order <- c(
+  "Brain", "Cardiovascular", "Kidney and Bladder", "Liver", "Lung",
+  "Muscle", "Pancreas", "Endocrine", "Adipose", "Immune", 
+  "Gastrointestinal", "Nerve", "Ovary", "Prostate", "Skin", "Arterial"
+)
+
+## 6.2 Create a Lookup Vector for Disease Names (Using the Filtered Diseases List)
+disease_names_lookup <- setNames(
+  map_chr(diseases, ~.x$name),
+  names(diseases)
+)
+
+## 6.2 Prepare Data for Grouped Heatmaps Using Diseases Config Names
+heatmap_data <- all_organ_age_results_with_mortality |>
+  # Use proper disease names from diseases_config (consistent with forest table approach)
+  mutate(
+    Disease_Display = case_when(
+      Disease == "Mortality" ~ "Mortality",
+      Disease == "Healthspan" ~ "End of Healthspan",
+      Disease %in% names(diseases) ~ disease_names_lookup[Disease],
+      TRUE ~ str_to_title(str_replace_all(Disease, "_", " "))
+    ),
+    # Create disease groups (explicit cancer list to catch cancers without _cancer suffix)
+    disease_group = {
+      cancer_keys <- c(
+        "melanoma","prostate_cancer","multiple_myeloma","brain_cancer","lung_cancer",
+        "breast_cancer","colorectal_cancer","kidney_cancer","bladder_cancer","esophageal_cancer",
+        "stomach_cancer","liver_cancer","lymphoma","leukemia","ovarian_cancer","thyroid_cancer",
+        "uterine_cancer","pancreatic_cancer","cervical_cancer"
+      )
+      case_when(
+        Disease == "Mortality" ~ "Non-Cancer Diseases",
+        Disease == "Healthspan" ~ "Non-Cancer Diseases",
+        Disease %in% cancer_keys ~ "Cancer",
+        Disease %in% names(diseases) ~ "Non-Cancer Diseases",
+        TRUE ~ "Other"
+      )
+    },
+    # Create significance indicators
+    significance = case_when(
+      impossible ~ "",  # No significance for impossible combinations
+      P_value_FDR < 0.001 ~ "***",
+      P_value_FDR < 0.01 ~ "**", 
+      P_value_FDR < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    # Create effect size for coloring (use HR directly with custom range)
+    effect_size = if_else(impossible, NA_real_, HR),
+    # Create color value based on effect size and significance
+    effect_size_colored = if_else(impossible, NA_real_, if_else(significance != "", effect_size, NA_real_)),
+    non_sig_marker = if_else(impossible, "", if_else(significance == "", "×", "")),
+    # Clean up organ names for display (consistent with forest table)
+    Organ_Display = case_when(
+      Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+      Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+      TRUE ~ str_to_title(Organ)
+    )
+  ) |>
+  # Arrange by disease group and disease
+  arrange(disease_group, Disease_Display, Organ)
+
+## 6.3 Function to Create Grouped Heatmap for Specific Disease Group and Model Type
+create_grouped_heatmap <- function(data, disease_group_name, model_type) {
+  group_data <- data |>
+    filter(disease_group == disease_group_name, Model_Type == model_type)
+  
+  if (nrow(group_data) == 0) {
+    return(NULL)
+  }
+  
+  # Use standardized ordering instead of clustering
+  available_diseases <- unique(group_data$Disease_Display)
+  available_organs <- unique(group_data$Organ_Display)
+  
+  # Create dynamic disease ordering based on available diseases
+  disease_order <- create_standardized_disease_order(diseases)
+  # Keep only diseases present in the data
+  disease_order <- intersect(disease_order, available_diseases)
+  
+  # Apply standardized organ ordering (keep only organs present in data)
+  organ_order <- intersect(standardized_organ_order, available_organs)
+  # Add any organs not in standardized order at the end
+  missing_organs <- setdiff(available_organs, standardized_organ_order)
+  organ_order <- c(organ_order, missing_organs)
+  
+  # Prepare data for plotting
+  group_data_clustered <- group_data |>
+    mutate(
+      Disease_Display = factor(Disease_Display, levels = disease_order),
+      Organ_Display = factor(Organ_Display, levels = organ_order)
+    )
+  
+  # Calculate dynamic range based on actual data
+  effect_range <- range(log(group_data$HR), na.rm = TRUE)
+  buffer <- 0.1
+  min_limit <- min(-1.5, effect_range[1] - buffer)
+  max_limit <- max(1.5, effect_range[2] + buffer)
+  
+  # Create dynamic breaks (5 breaks for symmetric scale)
+  breaks <- seq(min_limit, max_limit, length.out = 5)
+  labels <- sprintf("%.1f", breaks)
+  
+  # Create heatmap
+  ggplot(group_data_clustered, aes(x = Organ_Display, y = Disease_Display, fill = log(effect_size_colored))) +
+    geom_tile() +
+    # Add grey tiles for impossible combinations
+    geom_tile(data = group_data_clustered |> filter(impossible), fill = "grey80", alpha = 0.7) +
+    # Add white diagonal line through impossible combinations
+    geom_segment(
+      data = group_data_clustered |> filter(impossible),
+      aes(x = as.numeric(Organ_Display) - 0.4, y = as.numeric(Disease_Display) - 0.4,
+          xend = as.numeric(Organ_Display) + 0.4, yend = as.numeric(Disease_Display) + 0.4),
+      color = "white", linewidth = 1
+    ) +
+    geom_text(aes(label = non_sig_marker), size = 5, color = "darkgrey") +
+    scale_fill_gradientn(
+      colors = c(
+        "#2166AC",      # Blue for negative values
+        "white",        # White at zero
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(min_limit, 0, max_limit * 0.5, max_limit)),
+      limits = c(min_limit, max_limit),
+      na.value = "white",
+      name = "log(Hazard\nRatio)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 12),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 11),
+      axis.text.y = element_text(size = 11, hjust = 0, margin = margin(r = 15)),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = "right",
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 8),
+      legend.key.height = unit(0.8, "cm"),
+      legend.key.width = unit(0.5, "cm"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_blank(),
+      plot.margin = margin(1, 1, 1, 1, "cm")
+    ) +
+    coord_fixed(ratio = 1)  # Force square tiles
+}
+
+## 6.5 Create Combined Heatmap for All Diseases - Mortality Model
+# Create a function to make combined heatmap similar to within-pair analysis
+create_combined_heatmap <- function(data, model_type) {
+  # Filter data for the model type
+  model_data <- data |> filter(Model_Type == model_type)
+  
+  if (nrow(model_data) == 0) {
+    return(NULL)
+  }
+  
+  # Use standardized ordering
+  available_diseases <- unique(model_data$Disease_Display)
+  available_organs <- unique(model_data$Organ_Display)
+  
+  # Create dynamic disease ordering based on available diseases
+  disease_order <- create_standardized_disease_order(diseases)
+  # Keep only diseases present in the data
+  disease_order <- intersect(disease_order, available_diseases)
+  
+  # Apply standardized organ ordering (keep only organs present in data)
+  organ_order <- intersect(standardized_organ_order, available_organs)
+  # Add any organs not in standardized order at the end
+  missing_organs <- setdiff(available_organs, standardized_organ_order)
+  organ_order <- c(organ_order, missing_organs)
+  
+  if (length(disease_order) == 0 || length(organ_order) == 0) return(NULL)
+  
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  # Prepare data for plotting with numeric coordinates
+  model_data_plot <- model_data |>
+    mutate(
+      Disease_Display = factor(Disease_Display, levels = disease_order),
+      Organ_Display = factor(Organ_Display, levels = organ_order),
+      Disease_num = (as.numeric(Disease_Display) - 1) * square_size + square_size/2,
+      Organ_num = (as.numeric(Organ_Display) - 1) * square_size + square_size/2
+    )
+  
+  # Calculate dynamic range based on actual data (white-to-red only, no negative values)
+  effect_range <- range(log(model_data$HR), na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  # Create combined heatmap with panel styling
+  ggplot(model_data_plot, aes(x = Organ_num, y = Disease_num, fill = log(effect_size_colored))) +
+    geom_tile(width = square_size, height = square_size, color = NA) +
+    # Add grey tiles for impossible combinations
+    geom_tile(data = model_data_plot |> filter(impossible), fill = "grey80", alpha = 0.7, width = square_size, height = square_size, color = NA) +
+    # Add white diagonal line through impossible combinations
+    geom_segment(
+      data = model_data_plot |> filter(impossible),
+      aes(x = Organ_num - square_size/2, y = Disease_num - square_size/2,
+          xend = Organ_num + square_size/2, yend = Disease_num + square_size/2),
+      color = "white", linewidth = 0.8
+    ) +
+    geom_text(aes(x = Organ_num, y = Disease_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(0, max_limit * 0.5, max_limit)),
+      limits = c(0, max_limit),
+      na.value = "white",
+      name = "log(Hazard\nRatio)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    scale_x_continuous(
+      breaks = (seq_along(organ_order) - 1) * square_size + square_size/2,
+      labels = organ_order,
+      expand = c(0, 0),
+      limits = c(0, length(organ_order) * square_size)
+    ) +
+    scale_y_continuous(
+      breaks = (seq_along(disease_order) - 1) * square_size + square_size/2,
+      labels = disease_order,
+      expand = c(0, 0),
+      limits = c(0, length(disease_order) * square_size)
+    ) +
+    theme_minimal(base_family = "Helvetica") +
+    theme(
+      text = element_text(family = "Helvetica", color = "black"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      legend.position = "right",
+      legend.title = element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = unit(0.8, "cm"),
+      legend.key.width = unit(0.5, "cm"),
+      panel.grid = element_blank(),
+      panel.spacing = unit(0, "lines"),
+      panel.border = element_blank(),
+      plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    coord_fixed(ratio = 1, expand = FALSE)
+}
+
+## 6.6 Create Combined Heatmap - Mortality Model
+mortality_combined_heatmap <- create_combined_heatmap(heatmap_data, "Mortality")
+
+## 6.7 Display Combined Heatmap - Mortality Model
+cat("\nMortality Organ Age Model Results:\n")
+if (!is.null(mortality_combined_heatmap)) {
+  print(mortality_combined_heatmap)
+}
+
+## 6.8 Save the Combined Heatmap with New Framework Structure - Mortality Model
+# Create directories for the new framework structure
+dir.create(file.path(output_core_dir, "heatmap", "main"), showWarnings = FALSE, recursive = TRUE)
+
+if (!is.null(mortality_combined_heatmap)) {
+  ggsave(
+    filename = file.path(output_core_dir, "heatmap", "main", "mortality.svg"),
+    plot = mortality_combined_heatmap,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+  ggsave(
+    filename = file.path(output_core_dir, "heatmap", "main", "mortality.png"),
+    plot = mortality_combined_heatmap,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+
+```
+
+```{r mortality_heatmap_significant_only}
+## 6.8.1 Save a compact heatmap with only significant associations (FDR < 0.05)
+
+# Filter to significant associations for Mortality model only
+heatmap_data_sig_only <- heatmap_data |>
+  dplyr::filter(Model_Type == "Mortality", significance != "", !impossible)
+
+# Rebuild the heatmap using the same helper, but with filtered data
+mortality_heatmap_sig <- create_combined_heatmap(heatmap_data_sig_only, "Mortality")
+
+# Create output directory if needed and save
+if (!is.null(mortality_heatmap_sig)) {
+  dir.create(file.path(output_core_dir, "heatmap", "main"), showWarnings = FALSE, recursive = TRUE)
+  ggsave(
+    filename = file.path(output_core_dir, "heatmap", "main", "mortality_significant_only.svg"),
+    plot = mortality_heatmap_sig,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+  ggsave(
+    filename = file.path(output_core_dir, "heatmap", "main", "mortality_significant_only.png"),
+    plot = mortality_heatmap_sig,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+}
+```
+
+```{r}
+## 6.9 Create Summary Tables for Each Model Type
+mortality_summary <- heatmap_data |>
+  filter(Model_Type == "Mortality") |>
+  select(Disease_Display, Organ, HR, HR_lower, HR_upper, P_value_FDR, significance) |>
+  mutate(
+    HR_CI = sprintf("%.2f (%.2f-%.2f)", HR, HR_lower, HR_upper),
+    P_value_FDR = sprintf("%.2e", P_value_FDR),
+    Significant = if_else(significance != "", "Yes", "No")
+  ) |>
+  select(Disease_Display, Organ, HR_CI, P_value_FDR, Significant) |>
+  arrange(Disease_Display, Organ)
+
+## 6.10 Display Summary Tables
+
+cat("\nMortality Model Results:\n")
+
+print(mortality_summary)
+```
+
+# 7. Visualization: Forest Tables for Main Results
+
+Forest tables summarize hazard ratios and 95% CIs across outcomes.
+
+```{r main_forest_helpers}
+create_forest_table_combined_main <- function(data, 
+                                           disease_name = "Dementia",
+                                           model_type = "Mortality",
+                                           title = NULL,
+                                           main_color = "#2166AC") {
+  forest_data <- data |> 
+    filter(Model_Type == model_type, Disease == disease_name) |>
+    filter(!(Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate"),
+           !(Disease == "prostate_cancer" & Organ == "Ovary"))
+
+  if (disease_name == "Mortality") {
+    disease_cases <- twins_analysis |> summarise(cases = sum(deceased == 1, na.rm = TRUE)) |> pull(cases)
+    sample_size <- twins_analysis |> summarise(n = n()) |> pull(n)
+    display_name <- "Mortality"
+  } else if (disease_name == "Healthspan") {
+    disease_cases <- twins_analysis |> summarise(cases = sum(healthspan_event == 1, na.rm = TRUE)) |> pull(cases)
+    sample_size <- twins_analysis |> summarise(n = n()) |> pull(n)
+    display_name <- "End of Healthspan"
+  } else {
+    actual_column_name <- diseases[[disease_name]]$var
+    display_name <- diseases[[disease_name]]$name
+    
+    # Filter by sex for sex-specific diseases
+    data_for_counts <- twins_analysis
+    if (grepl("prostate", display_name, ignore.case = TRUE)) {
+      data_for_counts <- data_for_counts |> filter(sex == 1)  # Males only
+    } else if (grepl("breast|ovarian|uterine|cervical", display_name, ignore.case = TRUE)) {
+      data_for_counts <- data_for_counts |> filter(sex == 2)  # Females only
+    }
+    
+    disease_cases <- data_for_counts |> summarise(cases = sum(!!sym(actual_column_name) == 1, na.rm = TRUE)) |> pull(cases)
+    sample_size <- data_for_counts |> filter(!!sym(actual_column_name) == 0 | is.na(!!sym(actual_column_name))) |> summarise(n = n()) |> pull(n)
+  }
+
+  if (is.null(title)) title <- paste(display_name, "(cases =", disease_cases, ", n =", sample_size, ")")
+
+  forest_data <- forest_data |>
+    mutate(
+      hr = HR,
+      hr_lower = HR_lower,
+      hr_upper = HR_upper,
+      fdr = P_value_FDR,
+      significant = P_value_FDR < 0.05,
+      errorbar_color = if_else(P_value_FDR < 0.05, "grey30", "gray80"),
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        Organ == "Artery" ~ "Arterial",
+        TRUE ~ str_to_title(Organ)
+      )
+    ) |>
+    # Order by HR magnitude (descending - highest at top)
+    arrange(desc(hr)) |>
+    mutate(
+      y_pos = rev(row_number()),
+      Organ_Display = factor(Organ_Display, levels = Organ_Display)
+    )
+
+  # Dynamic x-axis limits with sensible defaults and breathing room
+  base_min <- 0.25
+  base_max <- 3
+  hard_min <- 0.05
+  hard_max <- 10
+
+  if (nrow(forest_data) > 0) {
+    hr_min <- suppressWarnings(min(forest_data$hr_lower, na.rm = TRUE))
+    hr_max <- suppressWarnings(max(forest_data$hr_upper, na.rm = TRUE))
+
+    if (!is.finite(hr_min)) hr_min <- base_min
+    if (!is.finite(hr_max)) hr_max <- base_max
+
+    hr_min <- max(hr_min, 0.001)
+
+    lower_margin_factor <- 0.9
+    upper_margin_factor <- 1.1
+
+    x_min <- min(base_min, hr_min * lower_margin_factor)
+    x_max <- max(base_max, hr_max * upper_margin_factor)
+
+    x_min <- max(hard_min, x_min)
+    x_max <- min(hard_max, x_max)
+  } else {
+    x_min <- base_min
+    x_max <- base_max
+  }
+
+  x_breaks <- pretty(c(x_min, x_max), n = 6)
+  x_breaks <- x_breaks[x_breaks >= x_min & x_breaks <= x_max]
+
+  # Add formatted HR column and detect if scientific notation is needed
+  forest_data <- forest_data |>
+    mutate(
+      use_sci = pmax(abs(hr), abs(hr_lower), abs(hr_upper), na.rm = TRUE) >= 10,
+      hr_formatted = if_else(
+        use_sci,
+        sprintf("%.1e (%.1e-%.1e)", hr, hr_lower, hr_upper),
+        sprintf("%.2f (%.2f-%.2f)", hr, hr_lower, hr_upper)
+      )
+    )
+
+  # Detect if we need wider table for scientific notation
+  has_sci_notation <- any(forest_data$use_sci)
+  table_width_ratio <- if (has_sci_notation) 3.2 else 2.5
+
+  tab <- forest_data |>
+    transmute(y_pos, `Organ age` = Organ_Display, `HR (95% CI)` = hr_formatted, `FDR` = sprintf("%.2e", fdr))
+
+  x_pos <- tibble(col = c("Organ age", "HR (95% CI)", "FDR"), x = c(1.0, 4.0, 7.5))
+  table_long <- tab |>
+    pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    left_join(x_pos, by = "col")
+
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3) +
+    geom_text(data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), aes(x = x, y = y_pos, label = col), hjust = c(0, 0, 1), fontface = "bold", inherit.aes = FALSE, size = 3.3) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 9.0), expand = c(0, 0)) +
+    labs(title = title) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(hjust = 0.1, size = 12), axis.title = element_blank(), axis.text.x = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank(), plot.margin = unit(c(12, 6, 6, 6), "pt"))
+
+  # Determine which points are out of bounds (based on HR only) and cap CIs to plot range
+  forest_data <- forest_data |>
+    mutate(
+      out_of_bounds_point = hr < x_min | hr > x_max,
+      hr_lower_capped = pmax(hr_lower, x_min),
+      hr_upper_capped = pmin(hr_upper, x_max),
+      has_any_value_outside = (hr < x_min | hr > x_max | hr_lower < x_min | hr_upper > x_max)
+    )
+
+  # Only plot data where the HR itself is within bounds
+  data_in_bounds <- forest_data |> filter(!out_of_bounds_point)
+
+  # Calculate legend positions (slightly separated)
+  legend_y <- max(forest_data$y_pos) + 1.5
+  legend_left_x <- x_min + (x_max - x_min) * 0.03
+  legend_right_x <- x_min + (x_max - x_min) * 0.60
+  legend_bottom_y <- 0.25
+  legend_bottom_x <- x_min + (x_max - x_min) * 0.60
+
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, fill = factor(seq_along(Organ) %% 2)), alpha = 0.6, show.legend = FALSE) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(aes(x = 1, xend = 1, y = 0.5, yend = max(forest_data$y_pos) + 0.75), linetype = "33", color = "grey10", size = 0.7) +
+    {if (nrow(data_in_bounds) > 0) geom_errorbarh(data = data_in_bounds, aes(xmin = hr_lower_capped, xmax = hr_upper_capped), color = data_in_bounds$errorbar_color, height = 0.15, size = 0.6)} +
+    {if (nrow(data_in_bounds) > 0) geom_point(data = data_in_bounds, aes(x = hr, color = significant), size = 2.5, shape = 16)} +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) geom_text(data = data_in_bounds |> filter(has_any_value_outside), aes(x = hr, y = y_pos + 0.25), label = "*", size = 3.5, color = "black")} +
+    annotate("text", x = legend_left_x, y = legend_y, label = "● Significant (FDR < 0.05)", hjust = 0, size = 2.6, color = main_color) +
+    annotate("text", x = legend_right_x, y = legend_y, label = "● Non-significant", hjust = 0, size = 2.6, color = "gray80") +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) annotate("text", x = legend_bottom_x, y = legend_bottom_y, label = "* Value outside plot range", hjust = 1, size = 2.4, color = "black")} +
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(
+      limits = c(x_min, x_max),
+      breaks = x_breaks,
+      labels = format(x_breaks, digits = 3, trim = TRUE)
+    ) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Hazard Ratio (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.y = element_blank(), axis.text.x = element_text(size = 9), axis.title.x = element_text(size = 10), panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(), plot.margin = unit(c(12, 12, 6, 0), "pt"), legend.position = "none") +
+    coord_cartesian(clip = "off")
+
+  p_table + p_forest + plot_layout(widths = c(table_width_ratio, 1.5))
+}
+```
+
+```{r main_forest_plots}
+disease_names <- names(diseases)
+
+
+# Create directories for the new framework structure
+dir.create(file.path(output_core_dir, "forest_table"), showWarnings = FALSE, recursive = TRUE)
+
+# Create only black and white forest tables
+main_all_disease_plots_bw <- list()
+for (disease_name in disease_names) {
+  disease_data <- all_organ_age_results_with_mortality |> filter(Model_Type == "Mortality", Disease == disease_name)
+  if (nrow(disease_data) == 0) next
+  plot <- create_forest_table_combined_main(all_organ_age_results_with_mortality, disease_name = disease_name, model_type = "Mortality", main_color = "black")
+  main_all_disease_plots_bw[[diseases[[disease_name]]$name]] <- plot
+}
+
+for (disease_display in names(main_all_disease_plots_bw)) {
+  filename <- paste0(tolower(str_replace_all(disease_display, " ", "_")), ".svg")
+  ggsave(filename = filename, plot = main_all_disease_plots_bw[[disease_display]], path = file.path(output_core_dir, "forest_table"), device = "svg", width = 7, height = 5, dpi = 300)
+}
+
+main_mortality_plot_bw <- create_forest_table_combined_main(all_organ_age_results_with_mortality, disease_name = "Mortality", model_type = "Mortality", main_color = "black")
+ggsave(filename = "mortality.svg", plot = main_mortality_plot_bw, path = file.path(output_core_dir, "forest_table"), device = "svg", width = 7, height = 5, dpi = 300)
+
+main_healthspan_plot_bw <- create_forest_table_combined_main(all_organ_age_results_with_mortality, disease_name = "Healthspan", model_type = "Mortality", main_color = "black")
+ggsave(filename = "healthspan.svg", plot = main_healthspan_plot_bw, path = file.path(output_core_dir, "forest_table"), device = "svg", width = 7, height = 5, dpi = 300)
+
+# Create tables directory for main Cox results
+dir.create(file.path(output_core_dir, "tables", "main"), showWarnings = FALSE, recursive = TRUE)
+
+# Save table data as CSV - Individual diseases
+for (disease_name in disease_names) {
+  disease_data <- all_organ_age_results_with_mortality |> filter(Model_Type == "Mortality", Disease == disease_name)
+  if (nrow(disease_data) == 0) next
+  
+  # Create table data
+  tab <- disease_data |>
+    mutate(
+      use_sci = pmax(abs(HR), abs(HR_lower), abs(HR_upper), na.rm = TRUE) >= 10,
+      hr_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", HR, HR_lower, HR_upper),
+        sprintf("%.2f (%.2f-%.2f)", HR, HR_lower, HR_upper)),
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        Organ == "Artery" ~ "Arterial",
+        TRUE ~ str_to_title(Organ)
+      )
+    ) |>
+    select(Organ = Organ_Display, `HR (95% CI)` = hr_formatted, FDR = P_value_FDR)
+  
+  # Save CSV
+  display_name <- diseases[[disease_name]]$name
+  filename <- paste0(tolower(str_replace_all(display_name, " ", "_")), ".csv")
+  write.csv(tab, file = file.path(output_core_dir, "tables", "main", filename), row.names = FALSE)
+}
+
+# Save table data as CSV - Mortality
+mortality_data <- all_organ_age_results_with_mortality |> filter(Model_Type == "Mortality", Disease == "Mortality")
+if (nrow(mortality_data) > 0) {
+  tab <- mortality_data |>
+    mutate(
+      use_sci = pmax(abs(HR), abs(HR_lower), abs(HR_upper), na.rm = TRUE) >= 10,
+      hr_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", HR, HR_lower, HR_upper),
+        sprintf("%.2f (%.2f-%.2f)", HR, HR_lower, HR_upper)),
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        Organ == "Artery" ~ "Arterial",
+        TRUE ~ str_to_title(Organ)
+      )
+    ) |>
+    select(Organ = Organ_Display, `HR (95% CI)` = hr_formatted, FDR = P_value_FDR)
+  
+  write.csv(tab, file = file.path(output_core_dir, "tables", "main", "mortality.csv"), row.names = FALSE)
+}
+
+# Save table data as CSV - Healthspan
+healthspan_data <- all_organ_age_results_with_mortality |> filter(Model_Type == "Mortality", Disease == "Healthspan")
+if (nrow(healthspan_data) > 0) {
+  tab <- healthspan_data |>
+    mutate(
+      use_sci = pmax(abs(HR), abs(HR_lower), abs(HR_upper), na.rm = TRUE) >= 10,
+      hr_formatted = if_else(use_sci,
+        sprintf("%.1e (%.1e-%.1e)", HR, HR_lower, HR_upper),
+        sprintf("%.2f (%.2f-%.2f)", HR, HR_lower, HR_upper)),
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        Organ == "Artery" ~ "Arterial",
+        TRUE ~ str_to_title(Organ)
+      )
+    ) |>
+    select(Organ = Organ_Display, `HR (95% CI)` = hr_formatted, FDR = P_value_FDR)
+  
+  write.csv(tab, file = file.path(output_core_dir, "tables", "main", "healthspan.csv"), row.names = FALSE)
+}
+```
+
+# 12. Forest Plot with Table for Mortality Results
+
+```{r forest_plot_mortality}
+## 12.1 Function to Create Forest Plot for a Single Disease Across All Organs
+create_forest_table_combined <- function(data, 
+                                        disease_name = "Dementia",
+                                        model_type = "Mortality",
+                                        title = NULL,
+                                        main_color = "#2166AC") {
+  
+  # Filter and prepare data for single disease analysis
+  forest_data <- data |>
+    filter(Model_Type == model_type, Disease == disease_name) |>
+    filter(!(Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate"),
+           !(Disease == "prostate_cancer" & Organ == "Ovary"))
+  
+  # Handle mortality case specially
+  if (disease_name == "Mortality") {
+    # For mortality, count deceased cases and total sample
+    disease_cases <- twins_analysis |>
+      summarise(cases = sum(deceased == 1, na.rm = TRUE)) |>
+      pull(cases)
+    sample_size <- twins_analysis |>
+      summarise(n = n()) |>
+      pull(n)
+    display_name <- "Mortality"
+  } else if (disease_name == "Healthspan") {
+    # For healthspan, use event definition directly
+    disease_cases <- twins_analysis |>
+      summarise(cases = sum(healthspan_event == 1, na.rm = TRUE)) |>
+      pull(cases)
+    sample_size <- twins_analysis |>
+      summarise(n = n()) |>
+      pull(n)
+    display_name <- "End of Healthspan"
+  } else {
+    # Get the actual column name from the diseases configuration
+    actual_column_name <- diseases[[disease_name]]$var
+    
+    # Get the display name for the title
+    display_name <- diseases[[disease_name]]$name
+    
+    # Filter by sex for sex-specific diseases
+    data_for_counts <- twins_analysis
+    if (grepl("prostate", display_name, ignore.case = TRUE)) {
+      data_for_counts <- data_for_counts |> filter(sex == 1)  # Males only
+    } else if (grepl("breast|ovarian|uterine|cervical", display_name, ignore.case = TRUE)) {
+      data_for_counts <- data_for_counts |> filter(sex == 2)  # Females only
+    }
+    
+    # Count cases for this disease
+    disease_cases <- data_for_counts |>
+      summarise(cases = sum(!!sym(actual_column_name) == 1, na.rm = TRUE)) |>
+      pull(cases)
+    
+    # Count total sample size (excluding prevalent cases)
+    sample_size <- data_for_counts |>
+      filter(!!sym(actual_column_name) == 0 | is.na(!!sym(actual_column_name))) |>
+      summarise(n = n()) |>
+      pull(n)
+  }
+  
+  # Create default title if none provided
+  if (is.null(title)) {
+    title <- paste(display_name, "(cases =", disease_cases, ", n =", sample_size, ")")
+  }
+  
+  forest_data <- forest_data |>
+    mutate(
+      hr = HR,
+      hr_lower = HR_lower,
+      hr_upper = HR_upper,
+      fdr = P_value_FDR,
+      significant = P_value_FDR < 0.05,
+      errorbar_color = if_else(P_value_FDR < 0.05, "grey30", "gray80"),
+      # Clean up organ names for display
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        Organ == "Artery" ~ "Arterial",
+        TRUE ~ str_to_title(Organ)
+      )
+    ) |>
+    # Order by HR magnitude (descending - highest at top)
+    arrange(desc(hr)) |>
+    mutate(
+      y_pos = rev(row_number()),
+      Organ_Display = factor(Organ_Display, levels = Organ_Display)
+    )
+  
+  # Dynamic x-axis limits with sensible defaults and breathing room
+  base_min <- 0.25
+  base_max <- 3
+  hard_min <- 0.05
+  hard_max <- 10
+
+  if (nrow(forest_data) > 0) {
+    hr_min <- suppressWarnings(min(forest_data$hr_lower, na.rm = TRUE))
+    hr_max <- suppressWarnings(max(forest_data$hr_upper, na.rm = TRUE))
+
+    if (!is.finite(hr_min)) hr_min <- base_min
+    if (!is.finite(hr_max)) hr_max <- base_max
+
+    hr_min <- max(hr_min, 0.001)
+
+    lower_margin_factor <- 0.9
+    upper_margin_factor <- 1.1
+
+    x_min <- min(base_min, hr_min * lower_margin_factor)
+    x_max <- max(base_max, hr_max * upper_margin_factor)
+
+    x_min <- max(hard_min, x_min)
+    x_max <- min(hard_max, x_max)
+  } else {
+    x_min <- base_min
+    x_max <- base_max
+  }
+
+  x_breaks <- pretty(c(x_min, x_max), n = 6)
+  x_breaks <- x_breaks[x_breaks >= x_min & x_breaks <= x_max]
+
+  # Add formatted HR column and detect if scientific notation is needed
+  forest_data <- forest_data |>
+    mutate(
+      use_sci = pmax(abs(hr), abs(hr_lower), abs(hr_upper), na.rm = TRUE) >= 10,
+      hr_formatted = if_else(
+        use_sci,
+        sprintf("%.1e (%.1e-%.1e)", hr, hr_lower, hr_upper),
+        sprintf("%.2f (%.2f-%.2f)", hr, hr_lower, hr_upper)
+      )
+    )
+
+  # Detect if we need wider table for scientific notation
+  has_sci_notation <- any(forest_data$use_sci)
+  table_width_ratio <- if (has_sci_notation) 3.2 else 2.5
+  
+  # Create table data
+  tab <- forest_data |>
+    transmute(
+      y_pos,
+      `Organ age` = Organ_Display,
+      `HR (95% CI)` = hr_formatted,
+      `FDR` = sprintf("%.2e", fdr)
+    )
+  
+  # Define table column positions
+  x_pos <- tibble(
+    col = c("Organ age", "HR (95% CI)", "FDR"),
+    x   = c(1.0, 4.0, 7.5)
+  )
+  
+  # Convert table to long format for plotting
+  table_long <- tab |>
+    select(y_pos, `Organ age`, `HR (95% CI)`, `FDR`) |>
+    pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    left_join(x_pos, by = "col")
+  
+  # Create table plot
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3) +
+    geom_text(data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1),
+              aes(x = x, y = y_pos, label = col),
+              hjust = c(0, 0, 1), fontface = "bold", inherit.aes = FALSE, size = 3.3) +
+    scale_y_continuous(breaks = NULL, labels = NULL,
+                       limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 9.0), expand = c(0,0)) +
+    labs(title = title) +
+    theme_minimal(base_size = 11, base_family = "Helvetica") +
+    theme(
+      plot.title = element_text(hjust = 0.1, size = 12, family = "Helvetica"),
+      axis.title = element_blank(),
+      axis.text.x = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      plot.margin = unit(c(12, 6, 6, 6), "pt"),
+      panel.background = element_rect(fill = "white", colour = NA)
+    )
+
+  # Determine which points are out of bounds (based on HR only) and cap CIs to plot range
+  forest_data <- forest_data |>
+    mutate(
+      out_of_bounds_point = hr < x_min | hr > x_max,
+      hr_lower_capped = pmax(hr_lower, x_min),
+      hr_upper_capped = pmin(hr_upper, x_max),
+      has_any_value_outside = (hr < x_min | hr > x_max | hr_lower < x_min | hr_upper > x_max)
+    )
+
+  # Only plot data where the HR itself is within bounds
+  data_in_bounds <- forest_data |> filter(!out_of_bounds_point)
+
+  # Calculate legend positions (slightly separated)
+  legend_y <- max(forest_data$y_pos) + 1.5
+  legend_left_x <- x_min + (x_max - x_min) * 0.03
+  legend_right_x <- x_min + (x_max - x_min) * 0.60
+  legend_bottom_y <- 0.25
+  legend_bottom_x <- x_min + (x_max - x_min) * 0.60
+
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    # Add alternating row background colors
+    geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, 
+                  fill = factor(seq_along(Organ) %% 2)), 
+              alpha = 0.6, show.legend = FALSE) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    
+    # Add reference line at HR = 1
+    geom_segment(aes(x = 1, xend = 1, y = 0.5, yend = max(forest_data$y_pos) + 0.75), 
+                 linetype = "33", color = "grey10", size = 0.7) +
+    # Add confidence intervals and point estimates
+    {if (nrow(data_in_bounds) > 0) geom_errorbarh(data = data_in_bounds, aes(xmin = hr_lower_capped, xmax = hr_upper_capped), color = data_in_bounds$errorbar_color, height = 0.15, size = 0.6)} +
+    {if (nrow(data_in_bounds) > 0) geom_point(data = data_in_bounds, aes(x = hr, color = significant), size = 2.5, shape = 16)} +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) geom_text(data = data_in_bounds |> filter(has_any_value_outside), aes(x = hr, y = y_pos + 0.25), label = "*", size = 3.5, color = "black")} +
+    
+    # Add legend annotations
+    annotate("text", x = legend_left_x, y = legend_y, 
+             label = "● Significant (FDR < 0.05)", hjust = 0, size = 2.6, color = main_color) +
+    annotate("text", x = legend_right_x, y = legend_y, 
+             label = "● Non-significant", hjust = 0, size = 2.6, color = "gray80") +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) annotate("text", x = legend_bottom_x, y = legend_bottom_y, label = "* Value outside plot range", hjust = 1, size = 2.4, color = "black")} +
+    
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(
+      limits = c(x_min, x_max),
+      breaks = x_breaks,
+      labels = format(x_breaks, digits = 3, trim = TRUE)
+    ) +
+    scale_y_continuous(breaks = NULL, labels = NULL,
+                       limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Hazard Ratio (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11, base_family = "Helvetica") +
+    theme(
+      axis.text.y = element_blank(),
+      axis.text.x = element_text(size = 9, family = "Helvetica"),
+      axis.title.x = element_text(size = 10, family = "Helvetica"),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      plot.margin = unit(c(12, 12, 6, 0), "pt"),
+      legend.position = "none"
+    ) +
+    coord_cartesian(clip = "off")
+  
+  # Combine table and forest plot
+  p_table + p_forest + plot_layout(widths = c(table_width_ratio, 1.5))
+}
+```
+
+```{r loop_all_diseases_forest_plots}
+## 12.2 Loop Through All Diseases to Create Forest Plots for Mortality Model
+disease_names <- names(diseases)
+all_disease_plots <- list()
+
+for (i in seq_along(disease_names)) {
+  disease_name <- disease_names[i]
+  disease_display_name <- diseases[[disease_name]]$name
+  
+  # Check if data exists for this disease
+  disease_data <- all_organ_age_results_with_mortality |>
+    filter(Model_Type == "Mortality", Disease == disease_name)
+  
+  if (nrow(disease_data) == 0) {
+    next
+  }
+  
+  # Create the forest plot
+  plot <- create_forest_table_combined(
+    data = all_organ_age_results_with_mortality,
+    disease_name = disease_name,
+    model_type = "Mortality",
+    main_color = "black"
+  )
+  
+  # Store and display the plot
+  all_disease_plots[[disease_display_name]] <- plot
+  print(plot)
+}
+
+```
+
+
+## 14.9 Within-pair Cox using all pairs
+
+```{r withinpair_allpairs_dataset}
+# Build per-disease, all-pairs dataset (incident-only), allowing 0/1/2 events per pair
+create_withinpair_allpairs_dataset <- function(spec, mz_only = FALSE, dz_only = FALSE) {
+  # Validate disease label
+  if (is.null(spec$name) || length(spec$name) == 0 || spec$name == "") {
+    stop("spec$name is empty or null")
+  }
+  
+  df <- create_time_to_event_age(twins_analysis, spec$var, spec$date, spec$name)$data |>
+    dplyr::group_by(pair_id) |>
+    dplyr::filter(dplyr::n() == 2) |>
+    dplyr::ungroup()
+  if (mz_only) df <- df |> dplyr::filter(bestzyg == 1)
+  if (dz_only) df <- df |> dplyr::filter(bestzyg == 2)
+  df |> dplyr::group_by(pair_id) |> dplyr::filter(sum(event, na.rm = TRUE) >= 1) |> dplyr::ungroup()
+}
+```
+
+```{r withinpair_allpairs_univariate}
+library(survival)
+
+fit_withinpair_uni <- function(df, organ_col, disease_key, label) {
+  f <- as.formula(paste0("Surv(time_to_event, event) ~ ", covariate_formula_terms, " + scale(`", organ_col, "`) + strata(pair_id)"))
+  fit <- coxph(f, data = df)
+  s <- summary(fit)
+  
+  # Find the organ age coefficient (last coefficient before strata)
+  n_coefs <- length(stats::coef(fit))
+  organ_coef_idx <- n_coefs  # Last coefficient is the organ age
+  
+  tibble::tibble(
+    Disease = disease_key,
+    Organ = organ_col,
+    HR = exp(stats::coef(fit)[organ_coef_idx]),
+    HR_lower = exp(stats::confint(fit)[organ_coef_idx, 1]),
+    HR_upper = exp(stats::confint(fit)[organ_coef_idx, 2]),
+    P_value = s$coefficients[organ_coef_idx, "Pr(>|z|)"],
+    Model_Type = label
+  )
+}
+
+run_withinpair_univariate <- function(disease_list, organ_cols, label, mz_only = FALSE, dz_only = FALSE) {
+  if (length(disease_list) == 0) return(tibble::tibble())
+  out <- list()
+  for (disease_key in names(disease_list)) {
+    spec <- disease_list[[disease_key]]
+    
+    # Healthspan uses numeric age, not a date column
+    if (disease_key == "healthspan") {
+      # Create healthspan dataset similar to run_healthspan_cox_age
+      df <- twins_analysis |>
+        dplyr::mutate(
+          time_to_event = healthspan - age,
+          event = healthspan_event
+        ) |>
+        dplyr::filter(!is.na(time_to_event), time_to_event > 0) |>
+        dplyr::group_by(pair_id) |>
+        dplyr::filter(dplyr::n() == 2) |>
+        dplyr::ungroup()
+      
+      if (mz_only) df <- df |> dplyr::filter(bestzyg == 1)
+      if (dz_only) df <- df |> dplyr::filter(bestzyg == 2)
+      df <- df |> dplyr::group_by(pair_id) |> dplyr::filter(sum(event, na.rm = TRUE) >= 1) |> dplyr::ungroup()
+    } else {
+      # Standard handling for other diseases
+      df <- create_withinpair_allpairs_dataset(spec, mz_only = mz_only, dz_only = dz_only)
+    }
+    
+    df <- df |>
+      dplyr::left_join(dplyr::select(organ_age_mortality, twin_id, dplyr::all_of(organ_cols)), by = "twin_id")
+    
+    if (nrow(df) == 0 || dplyr::n_distinct(df$pair_id) < 2) next
+    for (oc in organ_cols) {
+      # Skip impossible organ-disease combinations
+      # Female-specific diseases: skip Prostate organ
+      if (grepl("breast|ovarian|uterine|cervical", spec$name, ignore.case = TRUE) && oc == "Prostate") {
+        next
+      }
+      # Prostate cancer: skip Ovary organ
+      if (grepl("prostate", spec$name, ignore.case = TRUE) && oc == "Ovary") {
+        next
+      }
+      
+      if (!oc %in% names(df)) next
+      if (all(is.na(df[[oc]]))) next
+      res <- try(fit_withinpair_uni(df, oc, disease_key, label), silent = TRUE)
+      if (!inherits(res, "try-error")) out[[length(out) + 1]] <- res
+    }
+  }
+  if (length(out) == 0) return(tibble::tibble())
+  dplyr::bind_rows(out) |>
+    dplyr::group_by(Disease) |>
+    dplyr::mutate(P_value_FDR = p.adjust(P_value, method = "fdr")) |>
+    dplyr::ungroup()
+}
+
+# Create extended disease list that includes mortality and healthspan for within-pair analysis
+diseases_with_mortality_healthspan <- c(
+  diseases,
+  list(
+    mortality = list(var = "deceased", date = "deathdate", name = "Mortality"),
+    healthspan = list(var = "healthspan_event", date = "healthspan", name = "End of Healthspan")
+  )
+)
+
+# Debug: Check for empty names in diseases_with_mortality_healthspan
+cat("Checking diseases_with_mortality_healthspan:\n")
+for (i in seq_along(diseases_with_mortality_healthspan)) {
+  disease_name <- names(diseases_with_mortality_healthspan)[i]
+  spec <- diseases_with_mortality_healthspan[[i]]
+  cat("Disease:", disease_name, "Name:", spec$name, "Var:", spec$var, "Date:", spec$date, "\n")
+}
+
+# Run: all pairs, MZ-only, DZ-only (mortality-calibrated organ ages)
+wp_uni_all <- run_withinpair_univariate(diseases_with_mortality_healthspan, organ_age_cols_mortality, "WithinPair_All")
+wp_uni_mz  <- run_withinpair_univariate(diseases_with_mortality_healthspan, organ_age_cols_mortality, "WithinPair_MZ", mz_only = TRUE)
+wp_uni_dz  <- run_withinpair_univariate(diseases_with_mortality_healthspan, organ_age_cols_mortality, "WithinPair_DZ", dz_only = TRUE)
+```
+
+## 14.10 Within-pair univariate heatmaps (All/MZ/DZ)
+
+## 14.11 Forest Tables for Within-Pair Univariate Results
+
+```{r withinpair_uni_forest_helpers}
+
+# Function to calculate within-pair specific case counts
+calculate_withinpair_case_counts <- function(disease_name, model_type) {
+  # Determine zygosity filter based on model type
+  zygosity_filter <- case_when(
+    str_detect(model_type, "MZ") ~ 1,
+    str_detect(model_type, "DZ") ~ 2,
+    TRUE ~ NA_real_
+  )
+  
+  # Determine sex filter based on model type
+  sex_filter <- case_when(
+    str_detect(model_type, "Male") ~ 1,
+    str_detect(model_type, "Female") ~ 2,
+    TRUE ~ NA_real_
+  )
+  
+  # Get disease specification (support keys like "mortality"/"healthspan")
+  if (exists("diseases_with_mortality_healthspan")) {
+    # Prefer unified lookup including mortality/healthspan if available
+    if (disease_name %in% names(diseases_with_mortality_healthspan)) {
+      spec <- diseases_with_mortality_healthspan[[disease_name]]
+    } else if (tolower(disease_name) %in% names(diseases_with_mortality_healthspan)) {
+      spec <- diseases_with_mortality_healthspan[[tolower(disease_name)]]
+    } else if (disease_name %in% names(diseases)) {
+      spec <- diseases[[disease_name]]
+    } else {
+      spec <- NULL
+    }
+  } else {
+    # Fallback to previous behaviour
+    if (disease_name == "Mortality" || tolower(disease_name) == "mortality") {
+      spec <- list(var = "deceased", date = "deathdate", name = "Mortality")
+    } else if (disease_name == "Healthspan" || tolower(disease_name) == "healthspan") {
+      spec <- list(var = "healthspan_event", date = "healthspan", name = "End of Healthspan")
+    } else {
+      spec <- diseases[[disease_name]]
+    }
+  }
+
+  if (is.null(spec)) {
+    return(list(cases = 0, pairs = 0, display_name = as.character(disease_name)))
+  }
+  
+  # Create the within-pair dataset with appropriate filters
+  # Healthspan uses numeric age, not a date column
+  if (!is.null(spec$var) && spec$var == "healthspan_event") {
+    # Create healthspan dataset similar to run_withinpair_univariate
+    wp_data <- twins_analysis |>
+      dplyr::mutate(
+        time_to_event = healthspan - age,
+        event = healthspan_event
+      ) |>
+      dplyr::filter(!is.na(time_to_event), time_to_event > 0) |>
+      dplyr::group_by(pair_id) |>
+      dplyr::filter(dplyr::n() == 2) |>
+      dplyr::ungroup()
+    
+    # Apply zygosity filters
+    if (!is.na(zygosity_filter)) {
+      if (zygosity_filter == 1) {
+        wp_data <- wp_data |> dplyr::filter(bestzyg == 1)  # MZ only
+      } else {
+        wp_data <- wp_data |> dplyr::filter(bestzyg == 2)  # DZ only
+      }
+    }
+    
+    # Apply sex filters
+    if (!is.na(sex_filter)) {
+      wp_data <- wp_data |> dplyr::filter(sex == sex_filter)
+    }
+    
+    # Filter to pairs with at least one event
+    wp_data <- wp_data |> 
+      dplyr::group_by(pair_id) |> 
+      dplyr::filter(sum(event, na.rm = TRUE) >= 1) |> 
+      dplyr::ungroup()
+    
+  } else if (!is.null(spec$var) && spec$var == "deceased") {
+    # Mortality model branch
+    wp_data <- twins_analysis |>
+      dplyr::mutate(
+        age_at_event = dplyr::case_when(
+          deceased == 1 & !is.na(deathdate) ~ as.numeric(deathdate - birthdate) / 365.25,
+          TRUE ~ as.numeric(end_followup - birthdate) / 365.25
+        ),
+        time_to_event = age_at_event - age,
+        event = deceased
+      ) |>
+      dplyr::filter(time_to_event > 0) |>
+      dplyr::group_by(pair_id) |>
+      dplyr::filter(dplyr::n() == 2) |>
+      dplyr::ungroup()
+    
+    # Apply zygosity filters
+    if (!is.na(zygosity_filter)) {
+      if (zygosity_filter == 1) {
+        wp_data <- wp_data |> dplyr::filter(bestzyg == 1)  # MZ only
+      } else {
+        wp_data <- wp_data |> dplyr::filter(bestzyg == 2)  # DZ only
+      }
+    }
+    
+    # Apply sex filters
+    if (!is.na(sex_filter)) {
+      wp_data <- wp_data |> dplyr::filter(sex == sex_filter)
+    }
+    
+    # Filter to pairs with at least one event
+    wp_data <- wp_data |> 
+      dplyr::group_by(pair_id) |> 
+      dplyr::filter(sum(event, na.rm = TRUE) >= 1) |> 
+      dplyr::ungroup()
+    
+  } else {
+    # Standard disease handling - use create_withinpair_allpairs_dataset
+    # Apply zygosity first
+    mz_flag <- (!is.na(zygosity_filter) && zygosity_filter == 1)
+    dz_flag <- (!is.na(zygosity_filter) && zygosity_filter == 2)
+    
+    wp_data <- create_withinpair_allpairs_dataset(spec, mz_only = mz_flag, dz_only = dz_flag)
+    
+    # Apply sex filter if needed
+    if (!is.na(sex_filter)) {
+      wp_data <- wp_data |> dplyr::filter(sex == sex_filter)
+    }
+  }
+  
+  if (nrow(wp_data) == 0) {
+    return(list(cases = 0, pairs = 0, display_name = spec$name))
+  }
+  
+  # Count cases and pairs
+  cases <- sum(wp_data$event, na.rm = TRUE)
+  pairs <- n_distinct(wp_data$pair_id)
+  
+  return(list(cases = cases, pairs = pairs, display_name = spec$name))
+}
+
+create_forest_table_combined_wp_uni <- function(data, disease_name = "Dementia", model_type = "WithinPair_All", title = NULL, main_color = "#2166AC") {
+  forest_data <- data |>
+    filter(Model_Type == model_type, Disease == disease_name) |>
+    filter(!(Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate"),
+           !(Disease == "prostate_cancer" & Organ == "Ovary"))
+
+  # Use within-pair specific case counting
+  case_counts <- calculate_withinpair_case_counts(disease_name, model_type)
+  disease_cases <- case_counts$cases
+  sample_size <- case_counts$pairs
+  display_name <- case_counts$display_name
+
+  if (is.null(title)) title <- paste(display_name, "(cases =", disease_cases, ", pairs =", sample_size, ")")
+
+  forest_data <- forest_data |>
+    mutate(
+      hr = HR,
+      hr_lower = HR_lower,
+      hr_upper = HR_upper,
+      p_value = P_value_FDR,
+      significant = P_value_FDR < 0.05,
+      errorbar_color = if_else(P_value_FDR < 0.05, "grey30", "gray80"),
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        Organ == "Artery" ~ "Arterial",
+        TRUE ~ str_to_title(Organ)
+      )
+    ) |>
+    # Order by HR magnitude (descending - highest at top)
+    arrange(desc(hr)) |>
+    mutate(
+      y_pos = rev(row_number()),
+      Organ_Display = factor(Organ_Display, levels = Organ_Display)
+    )
+
+  # Dynamic x-axis limits with sensible defaults and breathing room
+  base_min <- 0.25
+  base_max <- 3
+  hard_min <- 0.05
+  hard_max <- 10
+
+  if (nrow(forest_data) > 0) {
+    hr_min <- suppressWarnings(min(forest_data$hr_lower, na.rm = TRUE))
+    hr_max <- suppressWarnings(max(forest_data$hr_upper, na.rm = TRUE))
+
+    if (!is.finite(hr_min)) hr_min <- base_min
+    if (!is.finite(hr_max)) hr_max <- base_max
+
+    hr_min <- max(hr_min, 0.001)
+
+    lower_margin_factor <- 0.9
+    upper_margin_factor <- 1.1
+
+    x_min <- min(base_min, hr_min * lower_margin_factor)
+    x_max <- max(base_max, hr_max * upper_margin_factor)
+
+    x_min <- max(hard_min, x_min)
+    x_max <- min(hard_max, x_max)
+  } else {
+    x_min <- base_min
+    x_max <- base_max
+  }
+
+  x_breaks <- pretty(c(x_min, x_max), n = 6)
+  x_breaks <- x_breaks[x_breaks >= x_min & x_breaks <= x_max]
+
+  # Add formatted HR column and detect if scientific notation is needed
+  forest_data <- forest_data |>
+    mutate(
+      use_sci = pmax(abs(hr), abs(hr_lower), abs(hr_upper), na.rm = TRUE) >= 10,
+      hr_formatted = if_else(
+        use_sci,
+        sprintf("%.1e (%.1e-%.1e)", hr, hr_lower, hr_upper),
+        sprintf("%.2f (%.2f-%.2f)", hr, hr_lower, hr_upper)
+      )
+    )
+
+  # Detect if we need wider table for scientific notation
+  has_sci_notation <- any(forest_data$use_sci)
+  table_width_ratio <- if (has_sci_notation) 3.2 else 2.5
+
+  tab <- forest_data |>
+    transmute(y_pos, `Organ age` = Organ_Display, `HR (95% CI)` = hr_formatted, `FDR` = sprintf("%.2e", p_value))
+
+  x_pos <- tibble(col = c("Organ age", "HR (95% CI)", "FDR"), x = c(1.0, 4.0, 7.5))
+  table_long <- tab |>
+    pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    left_join(x_pos, by = "col")
+
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3) +
+    geom_text(data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), aes(x = x, y = y_pos, label = col), hjust = c(0, 0, 1), fontface = "bold", inherit.aes = FALSE, size = 3.3) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 9.0), expand = c(0, 0)) +
+    labs(title = title) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(hjust = 0.1, size = 12), axis.title = element_blank(), axis.text.x = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank(), plot.margin = unit(c(12, 6, 6, 6), "pt"))
+
+  # Determine which points are out of bounds (based on HR only) and cap CIs to plot range
+  forest_data <- forest_data |>
+    mutate(
+      out_of_bounds_point = hr < x_min | hr > x_max,
+      hr_lower_capped = pmax(hr_lower, x_min),
+      hr_upper_capped = pmin(hr_upper, x_max),
+      has_any_value_outside = (hr < x_min | hr > x_max | hr_lower < x_min | hr_upper > x_max)
+    )
+
+  # Only plot data where the HR itself is within bounds
+  data_in_bounds <- forest_data |> filter(!out_of_bounds_point)
+
+  # Calculate legend positions (slightly separated)
+  legend_y <- max(forest_data$y_pos) + 1.5
+  legend_left_x <- x_min + (x_max - x_min) * 0.03
+  legend_right_x <- x_min + (x_max - x_min) * 0.60
+  legend_bottom_y <- 0.25
+  legend_bottom_x <- x_min + (x_max - x_min) * 0.60
+
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, fill = factor(seq_along(Organ) %% 2)), alpha = 0.6, show.legend = FALSE) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(aes(x = 1, xend = 1, y = 0.5, yend = max(forest_data$y_pos) + 0.75), linetype = "33", color = "grey10", size = 0.7) +
+    {if (nrow(data_in_bounds) > 0) geom_errorbarh(data = data_in_bounds, aes(xmin = hr_lower_capped, xmax = hr_upper_capped), color = data_in_bounds$errorbar_color, height = 0.15, size = 0.6)} +
+    {if (nrow(data_in_bounds) > 0) geom_point(data = data_in_bounds, aes(x = hr, color = significant), size = 2.5, shape = 16)} +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) geom_text(data = data_in_bounds |> filter(has_any_value_outside), aes(x = hr, y = y_pos + 0.25), label = "*", size = 3.5, color = "black")} +
+    annotate("text", x = legend_left_x, y = legend_y, label = "● Significant (FDR < 0.05)", hjust = 0, size = 2.6, color = main_color) +
+    annotate("text", x = legend_right_x, y = legend_y, label = "● Non-significant", hjust = 0, size = 2.6, color = "gray80") +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) annotate("text", x = legend_bottom_x, y = legend_bottom_y, label = "* Value outside plot range", hjust = 1, size = 2.4, color = "black")} +
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(
+      limits = c(x_min, x_max),
+      breaks = x_breaks,
+      labels = format(x_breaks, digits = 3, trim = TRUE)
+    ) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Hazard Ratio (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.y = element_blank(), axis.text.x = element_text(size = 9), axis.title.x = element_text(size = 10), panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(), plot.margin = unit(c(12, 12, 6, 0), "pt"), legend.position = "none") +
+    coord_cartesian(clip = "off")
+
+  p_table + p_forest + plot_layout(widths = c(table_width_ratio, 1.5))
+}
+
+create_forest_table_significant_only_wp_uni <- function(data, disease_name = "Dementia", model_type = "WithinPair_All", title = NULL, main_color = "#2166AC") {
+  # Filter by FDR significance and impossible combinations
+  forest_data <- data |>
+    filter(Model_Type == model_type, Disease == disease_name, P_value_FDR < 0.05) |>
+    filter(!(Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate"),
+           !(Disease == "prostate_cancer" & Organ == "Ovary"))
+  if (nrow(forest_data) == 0) return(NULL)
+
+  # Use within-pair specific case counting
+  case_counts <- calculate_withinpair_case_counts(disease_name, model_type)
+  disease_cases <- case_counts$cases
+  sample_size <- case_counts$pairs
+  display_name <- case_counts$display_name
+
+  if (is.null(title)) title <- paste(display_name, "(cases =", disease_cases, ", pairs =", sample_size, ")")
+
+  forest_data <- forest_data |>
+    mutate(
+      hr = HR,
+      hr_lower = HR_lower,
+      hr_upper = HR_upper,
+      p_value = P_value_FDR,
+      significant = TRUE, # All are significant by definition after filtering
+      errorbar_color = "grey30", # All are significant, so all error bars are grey30
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        Organ == "Artery" ~ "Arterial",
+        TRUE ~ str_to_title(Organ)
+      )
+    ) |>
+    # Use standardized organ ordering instead of HR-based ordering
+    mutate(
+      Organ_Display = factor(Organ_Display, levels = standardized_organ_order),
+      y_pos = as.numeric(Organ_Display)
+    ) |>
+    arrange(y_pos)
+
+  # Dynamic x-axis limits with sensible defaults and breathing room
+  base_min <- 0.25
+  base_max <- 3
+  hard_min <- 0.05
+  hard_max <- 10
+
+  if (nrow(forest_data) > 0) {
+    hr_min <- suppressWarnings(min(forest_data$hr_lower, na.rm = TRUE))
+    hr_max <- suppressWarnings(max(forest_data$hr_upper, na.rm = TRUE))
+
+    if (!is.finite(hr_min)) hr_min <- base_min
+    if (!is.finite(hr_max)) hr_max <- base_max
+
+    hr_min <- max(hr_min, 0.001)
+
+    lower_margin_factor <- 0.9
+    upper_margin_factor <- 1.1
+
+    x_min <- min(base_min, hr_min * lower_margin_factor)
+    x_max <- max(base_max, hr_max * upper_margin_factor)
+
+    x_min <- max(hard_min, x_min)
+    x_max <- min(hard_max, x_max)
+  } else {
+    x_min <- base_min
+    x_max <- base_max
+  }
+
+  x_breaks <- pretty(c(x_min, x_max), n = 6)
+  x_breaks <- x_breaks[x_breaks >= x_min & x_breaks <= x_max]
+
+  # Add formatted HR column and detect if scientific notation is needed
+  forest_data <- forest_data |>
+    mutate(
+      use_sci = pmax(abs(hr), abs(hr_lower), abs(hr_upper), na.rm = TRUE) >= 10,
+      hr_formatted = if_else(
+        use_sci,
+        sprintf("%.1e (%.1e-%.1e)", hr, hr_lower, hr_upper),
+        sprintf("%.2f (%.2f-%.2f)", hr, hr_lower, hr_upper)
+      )
+    )
+
+  # Detect if we need wider table for scientific notation
+  has_sci_notation <- any(forest_data$use_sci)
+  table_width_ratio <- if (has_sci_notation) 3.2 else 2.5
+
+  tab <- forest_data |>
+    transmute(y_pos, `Organ age` = Organ_Display, `HR (95% CI)` = hr_formatted, `FDR` = sprintf("%.2e", p_value))
+
+  x_pos <- tibble(col = c("Organ age", "HR (95% CI)", "FDR"), x = c(1.0, 4.0, 7.5))
+  table_long <- tab |>
+    pivot_longer(-y_pos, names_to = "col", values_to = "val") |>
+    left_join(x_pos, by = "col")
+
+  p_table <- ggplot(table_long, aes(x = x, y = y_pos, label = val)) +
+    geom_text(hjust = c(0, 0, 1)[match(table_long$col, x_pos$col)], size = 3) +
+    geom_text(data = x_pos |> mutate(y_pos = max(forest_data$y_pos) + 1), aes(x = x, y = y_pos, label = col), hjust = c(0, 0, 1), fontface = "bold", inherit.aes = FALSE, size = 3.3) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
+    scale_x_continuous(limits = c(0.5, 9.0), expand = c(0, 0)) +
+    labs(title = title) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(hjust = 0.1, size = 12), axis.title = element_blank(), axis.text.x = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank(), plot.margin = unit(c(12, 6, 6, 6), "pt"))
+
+  # Determine which points are out of bounds (based on HR only) and cap CIs to plot range
+  forest_data <- forest_data |>
+    mutate(
+      out_of_bounds_point = hr < x_min | hr > x_max,
+      hr_lower_capped = pmax(hr_lower, x_min),
+      hr_upper_capped = pmin(hr_upper, x_max),
+      has_any_value_outside = (hr < x_min | hr > x_max | hr_lower < x_min | hr_upper > x_max)
+    )
+
+  # Only plot data where the HR itself is within bounds
+  data_in_bounds <- forest_data |> filter(!out_of_bounds_point)
+
+  # Calculate legend position (only significant legend in this version, nudged slightly)
+  legend_y <- max(forest_data$y_pos) + 1.5
+  legend_left_x <- x_min + (x_max - x_min) * 0.04
+  legend_bottom_y <- 0.25
+  legend_bottom_x <- x_min + (x_max - x_min) * 0.60
+
+  p_forest <- ggplot(forest_data, aes(y = y_pos)) +
+    geom_rect(aes(xmin = -Inf, xmax = Inf, ymin = y_pos - 0.5, ymax = y_pos + 0.5, fill = factor(seq_along(Organ) %% 2)), alpha = 0.6, show.legend = FALSE) +
+    scale_fill_manual(values = c("0" = "transparent", "1" = "gray95")) +
+    geom_segment(aes(x = 1, xend = 1, y = 0.5, yend = max(forest_data$y_pos) + 0.75), linetype = "33", color = "grey10", size = 0.7) +
+    {if (nrow(data_in_bounds) > 0) geom_errorbarh(data = data_in_bounds, aes(xmin = hr_lower_capped, xmax = hr_upper_capped), color = data_in_bounds$errorbar_color, height = 0.15, size = 0.6)} +
+    {if (nrow(data_in_bounds) > 0) geom_point(data = data_in_bounds, aes(x = hr, color = significant), size = 2.5, shape = 16)} +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) geom_text(data = data_in_bounds |> filter(has_any_value_outside), aes(x = hr, y = y_pos + 0.25), label = "*", size = 3.5, color = "black")} +
+    annotate("text", x = legend_left_x, y = legend_y, label = "● Significant (FDR < 0.05)", hjust = 0, size = 2.6, color = main_color) +
+    {if (nrow(data_in_bounds |> filter(has_any_value_outside)) > 0) annotate("text", x = legend_bottom_x, y = legend_bottom_y, label = "* Value outside plot range", hjust = 1, size = 2.4, color = "black")} +
+    scale_color_manual(values = c("TRUE" = main_color, "FALSE" = "gray80")) +
+    scale_x_continuous(
+      limits = c(x_min, x_max),
+      breaks = x_breaks,
+      labels = format(x_breaks, digits = 3, trim = TRUE)
+    ) +
+    scale_y_continuous(breaks = NULL, labels = NULL, limits = c(0.2, max(forest_data$y_pos) + 1.5)) +
+    labs(x = "Hazard Ratio (95% CI)", y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.y = element_blank(), axis.text.x = element_text(size = 9), axis.title.x = element_text(size = 10), panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(), plot.margin = unit(c(12, 12, 6, 0), "pt"), legend.position = "none") +
+    coord_cartesian(clip = "off")
+
+  p_table + p_forest + plot_layout(widths = c(table_width_ratio, 1.5))
+}
+```
+
+```{r withinpair_uni_forest_plots}
+# Create directories for within-pair forest tables
+dir.create(file.path(output_core_dir, "forest_table", "within_pair"), showWarnings = FALSE, recursive = TRUE)
+
+# All pairs forest plots
+if (exists("wp_uni_all") && nrow(wp_uni_all) > 0) {
+  wp_uni_all_disease_plots <- list()
+  for (disease_name in names(diseases_with_mortality_healthspan)) {
+    disease_data <- wp_uni_all |> filter(Model_Type == "WithinPair_All", Disease == disease_name)
+    if (nrow(disease_data) == 0) next
+    plot <- create_forest_table_combined_wp_uni(wp_uni_all, disease_name = disease_name, model_type = "WithinPair_All", main_color = "black")
+    wp_uni_all_disease_plots[[diseases_with_mortality_healthspan[[disease_name]]$name]] <- plot
+  }
+  
+  # Save all pairs forest plots
+  for (disease_display in names(wp_uni_all_disease_plots)) {
+    filename <- paste0(tolower(str_replace_all(disease_display, " ", "_")), "_all_pairs.svg")
+    filename <- str_replace(filename, "^end_of_healthspan_", "healthspan_")
+    ggsave(filename = filename, plot = wp_uni_all_disease_plots[[disease_display]], path = file.path(output_core_dir, "forest_table", "within_pair"), device = "svg", width = 8, height = 5, dpi = 300)
+  }
+}
+
+# MZ twins forest plots
+if (exists("wp_uni_mz") && nrow(wp_uni_mz) > 0) {
+  wp_uni_mz_disease_plots <- list()
+  for (disease_name in names(diseases_with_mortality_healthspan)) {
+    disease_data <- wp_uni_mz |> filter(Model_Type == "WithinPair_MZ", Disease == disease_name)
+    if (nrow(disease_data) == 0) next
+    plot <- create_forest_table_combined_wp_uni(wp_uni_mz, disease_name = disease_name, model_type = "WithinPair_MZ", main_color = "black")
+    wp_uni_mz_disease_plots[[diseases_with_mortality_healthspan[[disease_name]]$name]] <- plot
+  }
+  
+  # Save MZ twins forest plots
+  for (disease_display in names(wp_uni_mz_disease_plots)) {
+    filename <- paste0(tolower(str_replace_all(disease_display, " ", "_")), "_mz_twins.svg")
+    filename <- str_replace(filename, "^end_of_healthspan_", "healthspan_")
+    ggsave(filename = filename, plot = wp_uni_mz_disease_plots[[disease_display]], path = file.path(output_core_dir, "forest_table", "within_pair"), device = "svg", width = 8, height = 5, dpi = 300)
+  }
+}
+
+# DZ twins forest plots
+if (exists("wp_uni_dz") && nrow(wp_uni_dz) > 0) {
+  wp_uni_dz_disease_plots <- list()
+  for (disease_name in names(diseases_with_mortality_healthspan)) {
+    disease_data <- wp_uni_dz |> filter(Model_Type == "WithinPair_DZ", Disease == disease_name)
+    if (nrow(disease_data) == 0) next
+    plot <- create_forest_table_combined_wp_uni(wp_uni_dz, disease_name = disease_name, model_type = "WithinPair_DZ", main_color = "black")
+    wp_uni_dz_disease_plots[[diseases_with_mortality_healthspan[[disease_name]]$name]] <- plot
+  }
+  
+  # Save DZ twins forest plots
+  for (disease_display in names(wp_uni_dz_disease_plots)) {
+    filename <- paste0(tolower(str_replace_all(disease_display, " ", "_")), "_dz_twins.svg")
+    filename <- str_replace(filename, "^end_of_healthspan_", "healthspan_")
+    ggsave(filename = filename, plot = wp_uni_dz_disease_plots[[disease_display]], path = file.path(output_core_dir, "forest_table", "within_pair"), device = "svg", width = 8, height = 5, dpi = 300)
+  }
+}
+
+# Create tables directory
+dir.create(file.path(output_core_dir, "tables", "within_pair"), showWarnings = FALSE, recursive = TRUE)
+
+# Save table data as CSV - All pairs
+if (exists("wp_uni_all") && nrow(wp_uni_all) > 0) {
+  for (disease_name in names(diseases_with_mortality_healthspan)) {
+    disease_data <- wp_uni_all |> filter(Model_Type == "WithinPair_All", Disease == disease_name)
+    if (nrow(disease_data) == 0) next
+    
+    # Create table data
+    tab <- disease_data |>
+      mutate(
+        use_sci = pmax(abs(HR), abs(HR_lower), abs(HR_upper), na.rm = TRUE) >= 10,
+        hr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", HR, HR_lower, HR_upper),
+          sprintf("%.2f (%.2f-%.2f)", HR, HR_lower, HR_upper)),
+        Organ_Display = case_when(
+          Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+          Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+          Organ == "Artery" ~ "Arterial",
+          TRUE ~ str_to_title(Organ)
+        )
+      ) |>
+      select(Organ = Organ_Display, `HR (95% CI)` = hr_formatted, FDR = P_value_FDR)
+    
+    # Save CSV
+    display_name <- diseases_with_mortality_healthspan[[disease_name]]$name
+    filename <- paste0(tolower(str_replace_all(display_name, " ", "_")), "_all_pairs.csv")
+    filename <- str_replace(filename, "^end_of_healthspan_", "healthspan_")
+    write.csv(tab, file = file.path(output_core_dir, "tables", "within_pair", filename), row.names = FALSE)
+  }
+}
+
+# Save table data as CSV - MZ twins
+if (exists("wp_uni_mz") && nrow(wp_uni_mz) > 0) {
+  for (disease_name in names(diseases_with_mortality_healthspan)) {
+    disease_data <- wp_uni_mz |> filter(Model_Type == "WithinPair_MZ", Disease == disease_name)
+    if (nrow(disease_data) == 0) next
+    
+    # Create table data
+    tab <- disease_data |>
+      mutate(
+        use_sci = pmax(abs(HR), abs(HR_lower), abs(HR_upper), na.rm = TRUE) >= 10,
+        hr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", HR, HR_lower, HR_upper),
+          sprintf("%.2f (%.2f-%.2f)", HR, HR_lower, HR_upper)),
+        Organ_Display = case_when(
+          Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+          Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+          Organ == "Artery" ~ "Arterial",
+          TRUE ~ str_to_title(Organ)
+        )
+      ) |>
+      select(Organ = Organ_Display, `HR (95% CI)` = hr_formatted, FDR = P_value_FDR)
+    
+    # Save CSV
+    display_name <- diseases_with_mortality_healthspan[[disease_name]]$name
+    filename <- paste0(tolower(str_replace_all(display_name, " ", "_")), "_mz_twins.csv")
+    filename <- str_replace(filename, "^end_of_healthspan_", "healthspan_")
+    write.csv(tab, file = file.path(output_core_dir, "tables", "within_pair", filename), row.names = FALSE)
+  }
+}
+
+# Save table data as CSV - DZ twins
+if (exists("wp_uni_dz") && nrow(wp_uni_dz) > 0) {
+  for (disease_name in names(diseases_with_mortality_healthspan)) {
+    disease_data <- wp_uni_dz |> filter(Model_Type == "WithinPair_DZ", Disease == disease_name)
+    if (nrow(disease_data) == 0) next
+    
+    # Create table data
+    tab <- disease_data |>
+      mutate(
+        use_sci = pmax(abs(HR), abs(HR_lower), abs(HR_upper), na.rm = TRUE) >= 10,
+        hr_formatted = if_else(use_sci,
+          sprintf("%.1e (%.1e-%.1e)", HR, HR_lower, HR_upper),
+          sprintf("%.2f (%.2f-%.2f)", HR, HR_lower, HR_upper)),
+        Organ_Display = case_when(
+          Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+          Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+          Organ == "Artery" ~ "Arterial",
+          TRUE ~ str_to_title(Organ)
+        )
+      ) |>
+      select(Organ = Organ_Display, `HR (95% CI)` = hr_formatted, FDR = P_value_FDR)
+    
+    # Save CSV
+    display_name <- diseases_with_mortality_healthspan[[disease_name]]$name
+    filename <- paste0(tolower(str_replace_all(display_name, " ", "_")), "_dz_twins.csv")
+    filename <- str_replace(filename, "^end_of_healthspan_", "healthspan_")
+    write.csv(tab, file = file.path(output_core_dir, "tables", "within_pair", filename), row.names = FALSE)
+  }
+}
+```
+
+```{r withinpair_heatmaps_univariate}
+make_wp_heatmap <- function(df, disease_list = NULL) {
+  if (nrow(df) == 0) return(NULL)
+  
+  # Use provided disease list or fall back to global diseases
+  diseases_to_use <- if (!is.null(disease_list)) disease_list else diseases
+  
+  # Panel-style control variables
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  # Prepare data with display names
+  df_plot <- df |>
+    dplyr::mutate(
+      Disease_Display = dplyr::case_when(
+        Disease %in% names(diseases_to_use) ~ purrr::map_chr(Disease, ~ diseases_to_use[[.x]]$name),
+        TRUE ~ stringr::str_to_title(stringr::str_replace_all(Disease, "_", " "))
+      ),
+      Organ_Display = dplyr::case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        TRUE ~ stringr::str_to_title(Organ)
+      ),
+      # Create effect size for coloring (use HR directly, consistent with regular heatmaps)
+      effect_size = HR,
+      significance = dplyr::case_when(
+        P_value_FDR < 0.001 ~ "***",
+        P_value_FDR < 0.01 ~ "**",
+        P_value_FDR < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      effect_size_colored = dplyr::if_else(significance != "", effect_size, NA_real_),
+      non_sig_marker = dplyr::if_else(significance == "", "×", "")
+    )
+  
+  # Get available diseases and organs from data
+  available_diseases <- unique(df_plot$Disease_Display) |> na.omit()
+  available_organs <- unique(df_plot$Organ_Display) |> na.omit()
+  
+  # Get standardized orders and filter to available items
+  disease_order <- create_standardized_disease_order(diseases_to_use)
+  disease_order <- intersect(disease_order, available_diseases)
+  
+  organ_order <- standardized_organ_order
+  organ_order <- intersect(organ_order, available_organs)
+  # Add any organs not in standardized order at the end
+  missing_organs <- setdiff(available_organs, standardized_organ_order)
+  organ_order <- c(organ_order, missing_organs)
+  
+  if (length(disease_order) == 0 || length(organ_order) == 0) return(NULL)
+  
+  # Now apply ordering and calculate numeric positions
+  df_plot <- df_plot |>
+    dplyr::mutate(
+      Disease_Display = factor(Disease_Display, levels = disease_order),
+      Organ_Display = factor(Organ_Display, levels = organ_order),
+      Disease_num = (as.numeric(Disease_Display) - 1) * square_size + square_size/2,
+      Organ_num = (as.numeric(Organ_Display) - 1) * square_size + square_size/2
+    )
+  
+  # Calculate dynamic range (white-to-red only, no negative values)
+  effect_range <- range(log(df_plot$HR), na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  ggplot2::ggplot(df_plot, ggplot2::aes(x = Organ_num, y = Disease_num, fill = log(effect_size_colored))) +
+    ggplot2::geom_tile(width = square_size, height = square_size, color = NA) +
+    ggplot2::geom_text(ggplot2::aes(x = Organ_num, y = Disease_num, label = non_sig_marker), size = 5.5, color = "darkgrey", family = "Helvetica", inherit.aes = FALSE) +
+    ggplot2::scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Darker red (extreme high)
+      ),
+      values = scales::rescale(c(0, max_limit * 0.5, max_limit)),
+      limits = c(0, max_limit),
+      na.value = "white",
+      name = "log(Hazard\nRatio)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = (seq_along(organ_order) - 1) * square_size + square_size/2,
+      labels = organ_order,
+      expand = c(0, 0),
+      limits = c(0, length(organ_order) * square_size)
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = (seq_along(disease_order) - 1) * square_size + square_size/2,
+      labels = disease_order,
+      expand = c(0, 0),
+      limits = c(0, length(disease_order) * square_size)
+    ) +
+    ggplot2::labs(x = NULL, y = NULL) +
+    ggplot2::theme_minimal(base_family = "Helvetica") +
+    ggplot2::theme(
+      text = ggplot2::element_text(family = "Helvetica", color = "black"),
+      axis.text.x = ggplot2::element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black", family = "Helvetica"),
+      axis.text.y = ggplot2::element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = ggplot2::margin(r = 10), color = "black", family = "Helvetica"),
+      axis.title = ggplot2::element_blank(),
+      axis.ticks = ggplot2::element_blank(),
+      legend.position = "right",
+      legend.title = ggplot2::element_text(size = 11, color = "black", family = "Helvetica"),
+      legend.text = ggplot2::element_text(size = 9, color = "black", family = "Helvetica"),
+      legend.key.height = ggplot2::unit(0.8, "cm"),
+      legend.key.width = ggplot2::unit(0.5, "cm"),
+      panel.grid = ggplot2::element_blank(),
+      panel.spacing = ggplot2::unit(0, "lines"),
+      panel.border = ggplot2::element_blank(),
+      plot.margin = ggplot2::margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    ggplot2::coord_fixed(ratio = 1, expand = FALSE)
+}
+
+dir.create(file.path(output_core_dir, "heatmap", "within_pair"), showWarnings = FALSE, recursive = TRUE)
+
+if (exists("wp_uni_all") && nrow(wp_uni_all) > 0) {
+  p_all <- make_wp_heatmap(wp_uni_all, diseases_with_mortality_healthspan)
+  if (!is.null(p_all)) {
+    ggplot2::ggsave(filename = "all_pairs.svg", plot = p_all, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "svg", width = 10, height = 8, dpi = 300)
+    ggplot2::ggsave(filename = "all_pairs.png", plot = p_all, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "png", width = 10, height = 8, dpi = 300)
+  }
+}
+if (exists("wp_uni_mz") && nrow(wp_uni_mz) > 0) {
+  p_mz <- make_wp_heatmap(wp_uni_mz, diseases_with_mortality_healthspan)
+  if (!is.null(p_mz)) {
+    ggplot2::ggsave(filename = "mz_twins.svg", plot = p_mz, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "svg", width = 10, height = 8, dpi = 300)
+    ggplot2::ggsave(filename = "mz_twins.png", plot = p_mz, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "png", width = 10, height = 8, dpi = 300)
+  }
+}
+if (exists("wp_uni_dz") && nrow(wp_uni_dz) > 0) {
+  p_dz <- make_wp_heatmap(wp_uni_dz, diseases_with_mortality_healthspan)
+  if (!is.null(p_dz)) {
+    ggplot2::ggsave(filename = "dz_twins.svg", plot = p_dz, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "svg", width = 10, height = 8, dpi = 300)
+    ggplot2::ggsave(filename = "dz_twins.png", plot = p_dz, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "png", width = 10, height = 8, dpi = 300)
+  }
+}
+
+# Significant-only within-pair heatmaps (filter out outcomes with no significant associations)
+if (exists("wp_uni_all") && nrow(wp_uni_all) > 0) {
+  # Find outcomes that have at least one significant association
+  outcomes_with_sig <- wp_uni_all |>
+    dplyr::filter(P_value_FDR < 0.05) |>
+    dplyr::distinct(Disease) |>
+    dplyr::pull(Disease)
+  
+  # Filter to only include outcomes that have significant associations
+  wp_uni_all_sig <- wp_uni_all |>
+    dplyr::filter(Disease %in% outcomes_with_sig)
+  
+  if (nrow(wp_uni_all_sig) > 0) {
+    p_all_sig <- make_wp_heatmap(wp_uni_all_sig, diseases_with_mortality_healthspan)
+    if (!is.null(p_all_sig)) {
+      ggplot2::ggsave(filename = "all_pairs_significant_only.svg", plot = p_all_sig, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "svg", width = 10, height = 8, dpi = 300)
+      ggplot2::ggsave(filename = "all_pairs_significant_only.png", plot = p_all_sig, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "png", width = 10, height = 8, dpi = 300)
+    }
+  }
+}
+if (exists("wp_uni_mz") && nrow(wp_uni_mz) > 0) {
+  outcomes_with_sig <- wp_uni_mz |>
+    dplyr::filter(P_value_FDR < 0.05) |>
+    dplyr::distinct(Disease) |>
+    dplyr::pull(Disease)
+  
+  wp_uni_mz_sig <- wp_uni_mz |>
+    dplyr::filter(Disease %in% outcomes_with_sig)
+  
+  if (nrow(wp_uni_mz_sig) > 0) {
+    p_mz_sig <- make_wp_heatmap(wp_uni_mz_sig, diseases_with_mortality_healthspan)
+    if (!is.null(p_mz_sig)) {
+      ggplot2::ggsave(filename = "mz_twins_significant_only.svg", plot = p_mz_sig, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "svg", width = 10, height = 8, dpi = 300)
+      ggplot2::ggsave(filename = "mz_twins_significant_only.png", plot = p_mz_sig, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "png", width = 10, height = 8, dpi = 300)
+    }
+  }
+}
+if (exists("wp_uni_dz") && nrow(wp_uni_dz) > 0) {
+  outcomes_with_sig <- wp_uni_dz |>
+    dplyr::filter(P_value_FDR < 0.05) |>
+    dplyr::distinct(Disease) |>
+    dplyr::pull(Disease)
+  
+  wp_uni_dz_sig <- wp_uni_dz |>
+    dplyr::filter(Disease %in% outcomes_with_sig)
+  
+  if (nrow(wp_uni_dz_sig) > 0) {
+    p_dz_sig <- make_wp_heatmap(wp_uni_dz_sig, diseases_with_mortality_healthspan)
+    if (!is.null(p_dz_sig)) {
+      ggplot2::ggsave(filename = "dz_twins_significant_only.svg", plot = p_dz_sig, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "svg", width = 10, height = 8, dpi = 300)
+      ggplot2::ggsave(filename = "dz_twins_significant_only.png", plot = p_dz_sig, path = file.path(output_core_dir, "heatmap", "within_pair"), device = "png", width = 10, height = 8, dpi = 300)
+    }
+  }
+}
+
+```
+
+## Panel Heatmaps: Significant Diseases Only
+
+```{r panel_heatmap_functions_cox}
+# Control variables for heatmap appearance
+HEATMAP_TEXT_SIZE <- 10
+HEATMAP_SQUARE_SIZE_DIVISOR <- 10
+
+create_panel_cox_heatmap <- function(data, model_type) {
+  model_data <- data |> filter(Model_Type == model_type)
+  if (nrow(model_data) == 0) return(NULL)
+  
+  available_organs <- unique(model_data$Organ_Display) |> na.omit()
+  organ_order <- c(intersect(standardized_organ_order, available_organs), setdiff(available_organs, standardized_organ_order))
+  
+  available_diseases <- unique(model_data$Disease_Display)
+  disease_order <- create_standardized_disease_order(diseases)
+  disease_order <- intersect(disease_order, available_diseases)
+  
+  if (length(disease_order) == 0 || length(organ_order) == 0) return(NULL)
+  
+  text_size_pt <- HEATMAP_TEXT_SIZE
+  square_size <- text_size_pt / HEATMAP_SQUARE_SIZE_DIVISOR
+  
+  model_data_plot <- model_data |>
+    mutate(
+      Disease_Display = factor(Disease_Display, levels = disease_order),
+      Organ_Display = factor(Organ_Display, levels = organ_order),
+      Disease_num = (as.numeric(Disease_Display) - 1) * square_size + square_size/2,
+      Organ_num = (as.numeric(Organ_Display) - 1) * square_size + square_size/2,
+      effect_size_colored = if_else(impossible, NA_real_, if_else(significance != "", log(HR), NA_real_)),
+      non_sig_marker = if_else(impossible, "", if_else(significance == "", "×", ""))
+    )
+  
+  effect_range <- range(log(model_data$HR), na.rm = TRUE)
+  buffer <- 0.1
+  max_limit <- max(1.5, effect_range[2] + buffer)
+  min_limit <- 0  # Start from 0 since no negative values
+  
+  breaks <- seq(0, max_limit, length.out = 4)
+  labels <- sprintf("%.1f", breaks)
+  
+  max_y <- length(disease_order) * square_size
+  max_x <- length(organ_order) * square_size
+  
+  ggplot(model_data_plot, aes(x = Organ_num, y = Disease_num, fill = effect_size_colored)) +
+    geom_tile(width = square_size, height = square_size, color = NA) +
+    geom_tile(data = model_data_plot |> filter(impossible), fill = "grey80", alpha = 0.7, width = square_size, height = square_size, color = NA) +
+    geom_segment(
+      data = model_data_plot |> filter(impossible),
+      aes(x = Organ_num - square_size/2, y = Disease_num - square_size/2,
+          xend = Organ_num + square_size/2, yend = Disease_num + square_size/2),
+      color = "white", linewidth = 0.8
+    ) +
+    geom_text(aes(x = Organ_num, y = Disease_num, label = non_sig_marker), size = 3.5, color = "darkgrey", inherit.aes = FALSE) +
+    scale_fill_gradientn(
+      colors = c(
+        "white",        # Start at 0
+        "#C64D4D",      # Red (mid-high)
+        "#B71C1C"       # Slightly darker red (extreme high)
+      ),
+      values = scales::rescale(c(0, max_limit * 0.5, max_limit)),
+      limits = c(0, max_limit),
+      na.value = "white",
+      name = "log(Hazard\nRatio)",
+      breaks = breaks,
+      labels = labels
+    ) +
+    scale_x_continuous(
+      breaks = (seq_along(organ_order) - 1) * square_size + square_size/2,
+      labels = organ_order,
+      expand = c(0, 0),
+      limits = c(0, length(organ_order) * square_size)
+    ) +
+    scale_y_continuous(
+      breaks = (seq_along(disease_order) - 1) * square_size + square_size/2,
+      labels = disease_order,
+      expand = c(0, 0),
+      limits = c(0, length(disease_order) * square_size)
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = HEATMAP_TEXT_SIZE, color = "black"),
+      axis.text.y = element_text(size = HEATMAP_TEXT_SIZE, hjust = 0, margin = margin(r = 10), color = "black"),
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      legend.position = "right",
+      legend.title = element_text(size = 9),
+      legend.text = element_text(size = 7),
+      legend.key.height = unit(0.6, "cm"),
+      legend.key.width = unit(0.4, "cm"),
+      panel.grid = element_blank(),
+      panel.spacing = unit(0, "lines"),
+      panel.border = element_blank(),
+      plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm")
+    ) +
+    coord_fixed(ratio = 1, expand = FALSE)
+}
+
+filter_significant_diseases_cox <- function(heatmap_data) {
+  significant_diseases <- heatmap_data |>
+    filter(significance != "", !impossible) |>
+    distinct(Disease_Display) |>
+    pull(Disease_Display)
+  
+  heatmap_data |>
+    filter(Disease_Display %in% significant_diseases)
+}
+```
+
+```{r create_cohort_panel_heatmap}
+# Filter cohort level results for significant diseases only
+# Version WITHOUT Mortality: Exclude Mortality and Healthspan (shown separately as KM curves)
+cohort_sig_data_no_mort <- heatmap_data |>
+  filter(Model_Type == "Mortality") |>
+  filter(Disease != "Mortality", Disease != "Healthspan") |>
+  filter_significant_diseases_cox()
+
+if (nrow(cohort_sig_data_no_mort) > 0) {
+  cohort_panel_heatmap_no_mort <- create_panel_cox_heatmap(cohort_sig_data_no_mort, "Mortality")
+  
+  if (!is.null(cohort_panel_heatmap_no_mort)) {
+    print(cohort_panel_heatmap_no_mort)
+    
+    panel_dir <- file.path(output_core_dir, "heatmap", "panel")
+    dir.create(panel_dir, showWarnings = FALSE, recursive = TRUE)
+    
+    # Calculate proportional height based on number of rows
+    # WP sig only has 6 rows with height = 3, so height per row = 0.5
+    # Cohort sig only should scale proportionally
+    cohort_n_rows <- length(unique(cohort_sig_data_no_mort$Disease_Display))
+    wp_n_rows <- 6  # Reference: WP sig only has 6 rows
+    wp_height <- 3  # Reference height for WP
+    height_per_row <- wp_height / wp_n_rows
+    cohort_height <- cohort_n_rows * height_per_row
+    
+    ggsave(
+      filename = file.path(panel_dir, "cohort_significant_diseases.pdf"),
+      plot = cohort_panel_heatmap_no_mort,
+      width = 7,
+      height = cohort_height,
+      dpi = 300,
+      device = "pdf"
+    )
+    ggsave(
+      filename = file.path(panel_dir, "cohort_significant_diseases.svg"),
+      plot = cohort_panel_heatmap_no_mort,
+      width = 7,
+      height = cohort_height,
+      dpi = 300,
+      device = "svg"
+    )
+    ggsave(
+      filename = file.path(panel_dir, "cohort_significant_diseases.png"),
+      plot = cohort_panel_heatmap_no_mort,
+      width = 7,
+      height = cohort_height,
+      dpi = 300,
+      device = "png"
+    )
+    
+    cat(paste("Cohort panel heatmap (without mortality) saved (", cohort_n_rows, "rows, height =", round(cohort_height, 2), ")\n", sep = ""))
+  }
+  
+  # Get list of significant diseases from cohort level (without mortality)
+  sig_diseases_cohort <- unique(cohort_sig_data_no_mort$Disease_Display)
+} else {
+  sig_diseases_cohort <- character(0)
+}
+
+# Version WITH Mortality: Exclude only Healthspan (shown separately as KM curves)
+cohort_sig_data_with_mort <- heatmap_data |>
+  filter(Model_Type == "Mortality") |>
+  filter(Disease != "Healthspan") |>
+  filter_significant_diseases_cox()
+
+if (nrow(cohort_sig_data_with_mort) > 0) {
+  cohort_panel_heatmap_with_mort <- create_panel_cox_heatmap(cohort_sig_data_with_mort, "Mortality")
+  
+  if (!is.null(cohort_panel_heatmap_with_mort)) {
+    print(cohort_panel_heatmap_with_mort)
+    
+    panel_dir <- file.path(output_core_dir, "heatmap", "panel")
+    dir.create(panel_dir, showWarnings = FALSE, recursive = TRUE)
+    
+    # Calculate proportional height based on number of rows
+    cohort_n_rows_mort <- length(unique(cohort_sig_data_with_mort$Disease_Display))
+    wp_n_rows <- 6  # Reference: WP sig only has 6 rows
+    wp_height <- 3  # Reference height for WP
+    height_per_row <- wp_height / wp_n_rows
+    cohort_height_mort <- cohort_n_rows_mort * height_per_row
+    
+    ggsave(
+      filename = file.path(panel_dir, "cohort_significant_diseases_with_mortality.pdf"),
+      plot = cohort_panel_heatmap_with_mort,
+      width = 7,
+      height = cohort_height_mort,
+      dpi = 300,
+      device = "pdf"
+    )
+    ggsave(
+      filename = file.path(panel_dir, "cohort_significant_diseases_with_mortality.svg"),
+      plot = cohort_panel_heatmap_with_mort,
+      width = 7,
+      height = cohort_height_mort,
+      dpi = 300,
+      device = "svg"
+    )
+    ggsave(
+      filename = file.path(panel_dir, "cohort_significant_diseases_with_mortality.png"),
+      plot = cohort_panel_heatmap_with_mort,
+      width = 7,
+      height = cohort_height_mort,
+      dpi = 300,
+      device = "png"
+    )
+    
+    cat(paste("Cohort panel heatmap (with mortality) saved (", cohort_n_rows_mort, "rows, height =", round(cohort_height_mort, 2), ")\n", sep = ""))
+  }
+  
+  # Get list of significant diseases from cohort level (with mortality)
+  sig_diseases_cohort_with_mort <- unique(cohort_sig_data_with_mort$Disease_Display)
+} else {
+  sig_diseases_cohort_with_mort <- character(0)
+}
+```
+
+```{r create_withinpair_panel_heatmap}
+# Create within-pair heatmap using same diseases as cohort level
+if (exists("wp_uni_all") && nrow(wp_uni_all) > 0 && length(sig_diseases_cohort) > 0) {
+  # Prepare within-pair data similar to heatmap_data structure
+  wp_heatmap_data <- wp_uni_all |>
+    mutate(
+      Disease_Display = case_when(
+        Disease == "Mortality" ~ "Mortality",
+        Disease == "Healthspan" ~ "End of Healthspan",
+        Disease %in% names(diseases_with_mortality_healthspan) ~ map_chr(Disease, ~ diseases_with_mortality_healthspan[[.x]]$name),
+        Disease %in% names(diseases) ~ disease_names_lookup[Disease],
+        TRUE ~ str_to_title(str_replace_all(Disease, "_", " "))
+      ),
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        TRUE ~ str_to_title(Organ)
+      ),
+      significance = case_when(
+        P_value_FDR < 0.001 ~ "***",
+        P_value_FDR < 0.01 ~ "**",
+        P_value_FDR < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      HR = HR,
+      non_sig_marker = if_else(significance == "", "×", ""),
+      impossible = case_when(
+        Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate" ~ TRUE,
+        Disease == "prostate_cancer" & Organ == "Ovary" ~ TRUE,
+        TRUE ~ FALSE
+      ),
+      Model_Type = "WithinPair_All"
+    ) |>
+    filter(Disease_Display %in% sig_diseases_cohort) |>
+    filter(Disease != "Mortality", Disease != "Healthspan")
+  
+  if (nrow(wp_heatmap_data) > 0) {
+    wp_panel_heatmap <- create_panel_cox_heatmap(wp_heatmap_data, "WithinPair_All")
+    
+    if (!is.null(wp_panel_heatmap)) {
+      print(wp_panel_heatmap)
+      
+      panel_dir <- file.path(output_core_dir, "heatmap", "panel")
+      dir.create(panel_dir, showWarnings = FALSE, recursive = TRUE)
+      
+      ggsave(
+        filename = file.path(panel_dir, "withinpair_significant_diseases.pdf"),
+        plot = wp_panel_heatmap,
+        width = 7,
+        height = 3,
+        dpi = 300,
+        device = "pdf"
+      )
+      ggsave(
+        filename = file.path(panel_dir, "withinpair_significant_diseases.svg"),
+        plot = wp_panel_heatmap,
+        width = 7,
+        height = 3,
+        dpi = 300,
+        device = "svg"
+      )
+      ggsave(
+        filename = file.path(panel_dir, "withinpair_significant_diseases.png"),
+        plot = wp_panel_heatmap,
+        width = 7,
+        height = 3,
+        dpi = 300,
+        device = "png"
+      )
+      
+      cat("Within-pair panel heatmap saved\n")
+    }
+  }
+}
+```
+
+
+## Within-Pair Significant Only Heatmap
+
+```{r create_withinpair_sig_only_heatmap}
+# Filter within-pair results for WP-significant diseases only
+# This shows only diseases that have at least one WP-significant association
+if (exists("wp_uni_all") && nrow(wp_uni_all) > 0) {
+  # Prepare WP data similar to heatmap_data structure
+  wp_all_data <- wp_uni_all |>
+    mutate(
+      Disease_Display = case_when(
+        Disease == "Mortality" ~ "Mortality",
+        Disease == "Healthspan" ~ "End of Healthspan",
+        Disease %in% names(diseases_with_mortality_healthspan) ~ map_chr(Disease, ~ diseases_with_mortality_healthspan[[.x]]$name),
+        Disease %in% names(diseases) ~ disease_names_lookup[Disease],
+        TRUE ~ str_to_title(str_replace_all(Disease, "_", " "))
+      ),
+      Organ_Display = case_when(
+        Organ == "Gastrointestinal_tract" ~ "Gastrointestinal",
+        Organ == "Kidney_urinary" ~ "Kidney and Bladder",
+        TRUE ~ str_to_title(Organ)
+      ),
+      significance = case_when(
+        P_value_FDR < 0.001 ~ "***",
+        P_value_FDR < 0.01 ~ "**",
+        P_value_FDR < 0.05 ~ "*",
+        TRUE ~ ""
+      ),
+      HR = HR,
+      non_sig_marker = if_else(significance == "", "×", ""),
+      impossible = case_when(
+        Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate" ~ TRUE,
+        Disease == "prostate_cancer" & Organ == "Ovary" ~ TRUE,
+        TRUE ~ FALSE
+      ),
+      Model_Type = "WithinPair_All"
+    )
+  
+  # Filter for WP-significant diseases (diseases with at least one WP-significant association)
+  wp_sig_diseases <- wp_all_data |>
+    filter(significance != "", !impossible) |>
+    distinct(Disease_Display) |>
+    pull(Disease_Display)
+  
+  wp_sig_only_data <- wp_all_data |>
+    filter(Disease_Display %in% wp_sig_diseases) |>
+    filter(tolower(Disease) != "mortality", tolower(Disease) != "healthspan")
+  
+  if (nrow(wp_sig_only_data) > 0) {
+    wp_sig_only_heatmap <- create_panel_cox_heatmap(wp_sig_only_data, "WithinPair_All")
+    
+    if (!is.null(wp_sig_only_heatmap)) {
+      print(wp_sig_only_heatmap)
+      
+      panel_dir <- file.path(output_core_dir, "heatmap", "panel")
+      dir.create(panel_dir, showWarnings = FALSE, recursive = TRUE)
+      
+      ggsave(
+        filename = file.path(panel_dir, "withinpair_significant_only.pdf"),
+        plot = wp_sig_only_heatmap,
+        width = 7,
+        height = 3,
+        dpi = 300,
+        device = "pdf"
+      )
+      ggsave(
+        filename = file.path(panel_dir, "withinpair_significant_only.svg"),
+        plot = wp_sig_only_heatmap,
+        width = 7,
+        height = 3,
+        dpi = 300,
+        device = "svg"
+      )
+      ggsave(
+        filename = file.path(panel_dir, "withinpair_significant_only.png"),
+        plot = wp_sig_only_heatmap,
+        width = 7,
+        height = 3,
+        dpi = 300,
+        device = "png"
+      )
+      
+      cat("Within-pair significant only heatmap saved\n")
+    }
+  } else {
+    cat("No WP-significant diseases found\n")
+  }
+} else {
+  cat("WP data not available\n")
+}
+```
+
