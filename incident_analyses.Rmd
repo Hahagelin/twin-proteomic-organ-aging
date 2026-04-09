@@ -1023,6 +1023,67 @@ print(mortality_summary)
 Forest tables summarize hazard ratios and 95% CIs across outcomes.
 
 ```{r main_forest_helpers}
+forest_count_covariates <- active_covariates
+
+filter_complete_covariates <- function(data, covariates) {
+  if (length(covariates) == 0) {
+    return(data)
+  }
+
+  data |>
+    dplyr::filter(dplyr::if_all(dplyr::all_of(covariates), ~ !is.na(.)))
+}
+
+calculate_main_case_counts <- function(disease_name) {
+  if (disease_name == "Mortality") {
+    mortality_data <- twins_analysis |>
+      mutate(
+        age_at_event = case_when(
+          deceased == 1 & !is.na(deathdate) ~ as.numeric(deathdate - birthdate) / 365.25,
+          TRUE ~ as.numeric(end_followup - birthdate) / 365.25
+        ),
+        time_to_event = age_at_event - age,
+        event = deceased
+      ) |>
+      filter(time_to_event > 0)
+
+    mortality_data <- filter_complete_covariates(mortality_data, forest_count_covariates)
+
+    return(list(
+      cases = sum(mortality_data$event, na.rm = TRUE),
+      n = nrow(mortality_data),
+      display_name = "Mortality"
+    ))
+  }
+
+  if (disease_name == "Healthspan") {
+    healthspan_data <- twins_analysis |>
+      mutate(
+        time_to_event = healthspan - age,
+        event = healthspan_event
+      ) |>
+      filter(!is.na(time_to_event), time_to_event > 0)
+
+    healthspan_data <- filter_complete_covariates(healthspan_data, forest_count_covariates)
+
+    return(list(
+      cases = sum(healthspan_data$event, na.rm = TRUE),
+      n = nrow(healthspan_data),
+      display_name = "End of Healthspan"
+    ))
+  }
+
+  spec <- diseases[[disease_name]]
+  incident_data <- create_time_to_event_age(twins_analysis, spec$var, spec$date, spec$name)$data
+  incident_data <- filter_complete_covariates(incident_data, forest_count_covariates)
+
+  list(
+    cases = sum(incident_data$event, na.rm = TRUE),
+    n = nrow(incident_data),
+    display_name = spec$name
+  )
+}
+
 create_forest_table_combined_main <- function(data, 
                                            disease_name = "Dementia",
                                            model_type = "Mortality",
@@ -1033,29 +1094,10 @@ create_forest_table_combined_main <- function(data,
     filter(!(Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate"),
            !(Disease == "prostate_cancer" & Organ == "Ovary"))
 
-  if (disease_name == "Mortality") {
-    disease_cases <- twins_analysis |> summarise(cases = sum(deceased == 1, na.rm = TRUE)) |> pull(cases)
-    sample_size <- twins_analysis |> summarise(n = n()) |> pull(n)
-    display_name <- "Mortality"
-  } else if (disease_name == "Healthspan") {
-    disease_cases <- twins_analysis |> summarise(cases = sum(healthspan_event == 1, na.rm = TRUE)) |> pull(cases)
-    sample_size <- twins_analysis |> summarise(n = n()) |> pull(n)
-    display_name <- "End of Healthspan"
-  } else {
-    actual_column_name <- diseases[[disease_name]]$var
-    display_name <- diseases[[disease_name]]$name
-    
-    # Filter by sex for sex-specific diseases
-    data_for_counts <- twins_analysis
-    if (grepl("prostate", display_name, ignore.case = TRUE)) {
-      data_for_counts <- data_for_counts |> filter(sex == 1)  # Males only
-    } else if (grepl("breast|ovarian|uterine|cervical", display_name, ignore.case = TRUE)) {
-      data_for_counts <- data_for_counts |> filter(sex == 2)  # Females only
-    }
-    
-    disease_cases <- data_for_counts |> summarise(cases = sum(!!sym(actual_column_name) == 1, na.rm = TRUE)) |> pull(cases)
-    sample_size <- data_for_counts |> filter(!!sym(actual_column_name) == 0 | is.na(!!sym(actual_column_name))) |> summarise(n = n()) |> pull(n)
-  }
+  case_counts <- calculate_main_case_counts(disease_name)
+  disease_cases <- case_counts$cases
+  sample_size <- case_counts$n
+  display_name <- case_counts$display_name
 
   if (is.null(title)) title <- paste(display_name, "(cases =", disease_cases, ", n =", sample_size, ")")
 
@@ -1305,51 +1347,10 @@ create_forest_table_combined <- function(data,
     filter(!(Disease %in% c("ovarian_cancer", "uterine_cancer", "breast_cancer") & Organ == "Prostate"),
            !(Disease == "prostate_cancer" & Organ == "Ovary"))
   
-  # Handle mortality case specially
-  if (disease_name == "Mortality") {
-    # For mortality, count deceased cases and total sample
-    disease_cases <- twins_analysis |>
-      summarise(cases = sum(deceased == 1, na.rm = TRUE)) |>
-      pull(cases)
-    sample_size <- twins_analysis |>
-      summarise(n = n()) |>
-      pull(n)
-    display_name <- "Mortality"
-  } else if (disease_name == "Healthspan") {
-    # For healthspan, use event definition directly
-    disease_cases <- twins_analysis |>
-      summarise(cases = sum(healthspan_event == 1, na.rm = TRUE)) |>
-      pull(cases)
-    sample_size <- twins_analysis |>
-      summarise(n = n()) |>
-      pull(n)
-    display_name <- "End of Healthspan"
-  } else {
-    # Get the actual column name from the diseases configuration
-    actual_column_name <- diseases[[disease_name]]$var
-    
-    # Get the display name for the title
-    display_name <- diseases[[disease_name]]$name
-    
-    # Filter by sex for sex-specific diseases
-    data_for_counts <- twins_analysis
-    if (grepl("prostate", display_name, ignore.case = TRUE)) {
-      data_for_counts <- data_for_counts |> filter(sex == 1)  # Males only
-    } else if (grepl("breast|ovarian|uterine|cervical", display_name, ignore.case = TRUE)) {
-      data_for_counts <- data_for_counts |> filter(sex == 2)  # Females only
-    }
-    
-    # Count cases for this disease
-    disease_cases <- data_for_counts |>
-      summarise(cases = sum(!!sym(actual_column_name) == 1, na.rm = TRUE)) |>
-      pull(cases)
-    
-    # Count total sample size (excluding prevalent cases)
-    sample_size <- data_for_counts |>
-      filter(!!sym(actual_column_name) == 0 | is.na(!!sym(actual_column_name))) |>
-      summarise(n = n()) |>
-      pull(n)
-  }
+  case_counts <- calculate_main_case_counts(disease_name)
+  disease_cases <- case_counts$cases
+  sample_size <- case_counts$n
+  display_name <- case_counts$display_name
   
   # Create default title if none provided
   if (is.null(title)) {
@@ -1822,6 +1823,11 @@ calculate_withinpair_case_counts <- function(disease_name, model_type) {
     }
   }
   
+  wp_data <- filter_complete_covariates(wp_data, forest_count_covariates) |>
+    dplyr::group_by(pair_id) |>
+    dplyr::filter(dplyr::n() == 2, sum(event, na.rm = TRUE) >= 1) |>
+    dplyr::ungroup()
+
   if (nrow(wp_data) == 0) {
     return(list(cases = 0, pairs = 0, display_name = spec$name))
   }
@@ -2864,4 +2870,3 @@ if (exists("wp_uni_all") && nrow(wp_uni_all) > 0) {
   cat("WP data not available\n")
 }
 ```
-

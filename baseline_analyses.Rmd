@@ -1520,17 +1520,22 @@ create_discordant_forest_table <- function(data, title, n_pairs, main_color = "b
 
 ```{r calculate_discordant_pair_counts}
 # Calculate number of discordant pairs for focused forest tables
-n_smoking_all <- twins_analysis |>
-  group_by(pair_id) |>
-  filter(n() == 2, sum(eversmok == 1, na.rm = TRUE) == 1) |>
-  summarise() |>
-  nrow()
+calculate_binary_discordant_pair_count <- function(outcome_var, mz_only = FALSE) {
+  twins_analysis |>
+    group_by(pair_id) |>
+    filter(
+      n() == 2,
+      if (mz_only) all(bestzyg == 1) else TRUE,
+      sum(.data[[outcome_var]] == 1, na.rm = TRUE) == 1
+    ) |>
+    summarise() |>
+    nrow()
+}
 
-n_smoking_mz <- twins_analysis |>
-  group_by(pair_id) |>
-  filter(n() == 2, all(bestzyg == 1), sum(eversmok == 1, na.rm = TRUE) == 1) |>
-  summarise() |>
-  nrow()
+n_smoking_all <- calculate_binary_discordant_pair_count("eversmok", mz_only = FALSE)
+n_smoking_mz <- calculate_binary_discordant_pair_count("eversmok", mz_only = TRUE)
+n_exercise_all <- calculate_binary_discordant_pair_count("exercise_how_often", mz_only = FALSE)
+n_exercise_mz <- calculate_binary_discordant_pair_count("exercise_how_often", mz_only = TRUE)
 ```
 
 ```{r create_focused_forest_table}
@@ -1789,6 +1794,76 @@ create_prevalent_disease_data <- function(disease_var, disease_date_var, disease
     )
 }
 
+filter_complete_covariates <- function(data, covariates) {
+  if (length(covariates) == 0) {
+    return(data)
+  }
+  
+  data |>
+    filter(if_all(all_of(covariates), ~ !is.na(.x)))
+}
+
+apply_prevalent_sex_filter <- function(data, disease_name) {
+  if (grepl("prostate", disease_name, ignore.case = TRUE)) {
+    data |> filter(sex == 1)
+  } else if (grepl("breast|ovarian", disease_name, ignore.case = TRUE)) {
+    data |> filter(sex == 2)
+  } else {
+    data
+  }
+}
+
+get_prevalent_model_covariates <- function(disease_name) {
+  covariates <- get_covariates("prevalent_disease")
+  
+  if (grepl("prostate|breast|ovarian", disease_name, ignore.case = TRUE)) {
+    covariates <- setdiff(covariates, "sex")
+  }
+  
+  covariates
+}
+
+calculate_prevalent_forest_counts <- function(disease_var, disease_date_var, disease_name, time_window = NULL) {
+  prevalent_data <- if (is.null(time_window)) {
+    create_prevalent_disease_data(disease_var, disease_date_var, disease_name)
+  } else {
+    build_prevalent_time_window(disease_var, disease_date_var, time_window)
+  }
+  
+  prevalent_data <- prevalent_data |>
+    apply_prevalent_sex_filter(disease_name) |>
+    filter_complete_covariates(get_prevalent_model_covariates(disease_name))
+  
+  list(
+    cases = sum(prevalent_data$prevalent_disease == 1, na.rm = TRUE),
+    sample_size = nrow(prevalent_data)
+  )
+}
+
+calculate_prevalent_discordant_counts <- function(prevalent_data, disease_name, mz_only = FALSE) {
+  discordant_twins <- prevalent_data |>
+    group_by(pair_id) |>
+    filter(
+      n() == 2,
+      if (mz_only) all(bestzyg == 1) else TRUE,
+      sum(prevalent_disease == 1, na.rm = TRUE) == 1
+    ) |>
+    ungroup() |>
+    apply_prevalent_sex_filter(disease_name) |>
+    group_by(pair_id) |>
+    filter(
+      n() == 2,
+      if (mz_only) all(bestzyg == 1) else TRUE,
+      sum(prevalent_disease == 1, na.rm = TRUE) == 1
+    ) |>
+    ungroup()
+  
+  list(
+    cases = sum(discordant_twins$prevalent_disease == 1, na.rm = TRUE),
+    n_pairs = n_distinct(discordant_twins$pair_id)
+  )
+}
+
 analyze_prevalent_disease_univariate <- function(prevalent_data, disease_name, predictor_df, predictor_name) {
   map_dfr(names(predictor_df)[-1], function(pred) {
     analysis_data <- prevalent_data |>
@@ -1861,64 +1936,14 @@ create_prevalent_forest_table <- function(data, disease_name, analysis_type = "u
   } else {
     display_name <- disease_config$name
     disease_var <- disease_config$var
-    
-    # Determine if sex filtering is needed
-    sex_filter <- if (grepl("prostate", display_name, ignore.case = TRUE)) {
-      1  # Males only
-    } else if (grepl("breast|ovarian", display_name, ignore.case = TRUE)) {
-      2  # Females only
-    } else {
-      NULL  # No sex filter
-    }
-    
-    # Debug output
-    if (!is.null(sex_filter)) {
-      cat("Disease:", display_name, "| Sex filter:", sex_filter, "\n")
-    }
-    
-    # Calculate cases based on time window
-    if (!is.null(time_window)) {
-      delta <- as.difftime(round(time_window * 365.25), units = "days")
-      
-      # Apply sex filter if needed
-      data_filtered <- twins_analysis
-      if (!is.null(sex_filter)) {
-        data_filtered <- data_filtered |> filter(sex == sex_filter)
-      }
-      
-      disease_cases <- data_filtered |> 
-        filter(
-          !!sym(disease_var) == 1, !is.na(!!sym(disease_config$date)),
-          !!sym(disease_config$date) <= checkdate,
-          !!sym(disease_config$date) >= checkdate - delta
-        ) |> 
-        nrow()
-      
-      sample_size <- data_filtered |> 
-        filter(
-          (!!sym(disease_var) == 0 | is.na(!!sym(disease_var))) |
-          (!!sym(disease_var) == 1 & !is.na(!!sym(disease_config$date)) & 
-           !!sym(disease_config$date) <= checkdate & 
-           !!sym(disease_config$date) >= checkdate - delta)
-        ) |> 
-        nrow()
-    } else {
-      # All prevalent cases (no time window)
-      # Apply sex filter if needed
-      data_filtered <- twins_analysis
-      if (!is.null(sex_filter)) {
-        data_filtered <- data_filtered |> filter(sex == sex_filter)
-      }
-      
-      disease_cases <- data_filtered |> 
-        filter(!!sym(disease_var) == 1, !is.na(!!sym(disease_config$date)), !!sym(disease_config$date) <= checkdate) |> 
-        nrow()
-      
-      sample_size <- data_filtered |> 
-        filter((!!sym(disease_var) == 0 | is.na(!!sym(disease_var))) |
-               (!!sym(disease_var) == 1 & !is.na(!!sym(disease_config$date)) & !!sym(disease_config$date) <= checkdate)) |> 
-        nrow()
-    }
+    counts <- calculate_prevalent_forest_counts(
+      disease_var = disease_var,
+      disease_date_var = disease_config$date,
+      disease_name = display_name,
+      time_window = time_window
+    )
+    disease_cases <- counts$cases
+    sample_size <- counts$sample_size
   }
   
   if (is.null(title)) {
@@ -2667,13 +2692,16 @@ for (window_name in names(time_window_discordant)) {
   tw_data <- time_window_discordant[[window_name]]
   
   if (!is.null(tw_data$all) && nrow(tw_data$all) > 0) {
-    diseases_to_plot <- unique(tw_data$all$disease)
-    for (disease_name in diseases_to_plot) {
-      n_pairs <- tw_data$all |> filter(disease == disease_name) |> slice(1) |> pull(n_pairs)
-      plot <- create_discordant_forest(tw_data$all, disease_name, n_pairs, "All Pairs")
+    diseases_to_plot <- unique(tw_data$all$disease_key)
+    for (disease_key_name in diseases_to_plot) {
+      disease_config <- diseases_config[[disease_key_name]]
+      years_back <- as.numeric(str_remove(window_name, "y"))
+      prev_data <- build_prevalent_time_window(disease_config$var, disease_config$date, years_back)
+      counts <- calculate_prevalent_discordant_counts(prev_data, disease_config$name, mz_only = FALSE)
+      plot_data <- tw_data$all |> filter(disease_key == disease_key_name) |> mutate(cases = counts$cases)
+      plot <- create_discordant_forest(plot_data, disease_config$name, counts$n_pairs, "All Pairs")
       if (!is.null(plot)) {
-        disease_config <- diseases_config[[disease_name]]
-        display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+        display_name <- disease_config$name
         filename <- paste0("forest_all_pairs_", tolower(str_replace_all(display_name, " ", "_")), ".svg")
         filepath <- file.path(prevalent_disease_base, "within", window_name, filename)
         save_plot(filepath, plot, width = 10, height = 5, dpi = 300)
@@ -2682,13 +2710,16 @@ for (window_name in names(time_window_discordant)) {
   }
   
   if (!is.null(tw_data$mz) && nrow(tw_data$mz) > 0) {
-    diseases_to_plot <- unique(tw_data$mz$disease)
-    for (disease_name in diseases_to_plot) {
-      n_pairs <- tw_data$mz |> filter(disease == disease_name) |> slice(1) |> pull(n_pairs)
-      plot <- create_discordant_forest(tw_data$mz, disease_name, n_pairs, "MZ Pairs")
+    diseases_to_plot <- unique(tw_data$mz$disease_key)
+    for (disease_key_name in diseases_to_plot) {
+      disease_config <- diseases_config[[disease_key_name]]
+      years_back <- as.numeric(str_remove(window_name, "y"))
+      prev_data <- build_prevalent_time_window(disease_config$var, disease_config$date, years_back)
+      counts <- calculate_prevalent_discordant_counts(prev_data, disease_config$name, mz_only = TRUE)
+      plot_data <- tw_data$mz |> filter(disease_key == disease_key_name) |> mutate(cases = counts$cases)
+      plot <- create_discordant_forest(plot_data, disease_config$name, counts$n_pairs, "MZ Pairs")
       if (!is.null(plot)) {
-        disease_config <- diseases_config[[disease_name]]
-        display_name <- if (!is.null(disease_config)) disease_config$name else disease_name
+        display_name <- disease_config$name
         filename <- paste0("forest_mz_pairs_", tolower(str_replace_all(display_name, " ", "_")), ".svg")
         filepath <- file.path(prevalent_disease_base, "within", window_name, filename)
         save_plot(filepath, plot, width = 10, height = 5, dpi = 300)
@@ -3071,7 +3102,7 @@ output_dir_within_pair <- file.path(current_health_base, "within_pair", "forest_
 dir.create(output_dir_within_pair, showWarnings = FALSE, recursive = TRUE)
 
 # Helper function to create forest table for within-pair results
-create_within_pair_forest_table <- function(data, outcome_name, pair_type_label, main_color = "black") {
+create_within_pair_forest_table <- function(data, outcome_name, pair_type_label, main_color = "black", n_pairs = NULL) {
   forest_data <- data |>
     filter(outcome == outcome_name, is.na(error_message))
 
@@ -3093,6 +3124,12 @@ create_within_pair_forest_table <- function(data, outcome_name, pair_type_label,
     outcome_name == "exercise_how_often" ~ "Exercise Frequency",
     TRUE ~ outcome_name
   )
+  
+  title <- if (is.null(n_pairs)) {
+    paste0(display_name, " - ", pair_type_label)
+  } else {
+    paste0(display_name, " - ", pair_type_label, " (n = ", n_pairs, " pairs)")
+  }
 
   forest_data <- forest_data |>
     mutate(
@@ -3159,7 +3196,7 @@ create_within_pair_forest_table <- function(data, outcome_name, pair_type_label,
     ) +
     scale_y_continuous(breaks = NULL, limits = c(0.5, max(forest_data$y_pos) + 1.5)) +
     scale_x_continuous(limits = c(0.5, 7.0), expand = c(0, 0)) +
-    labs(title = paste0(display_name, " - ", pair_type_label)) +
+    labs(title = title) +
     theme_minimal(base_size = 11) +
     theme(
       plot.title = element_text(hjust = 0.1, size = 12),
@@ -3295,10 +3332,17 @@ for (outcome_name in cont_outcomes) {
 # Create forest tables for smoking and exercise using within-pair style
 # Save to same directory as continuous outcomes
 binary_outcomes_for_forest <- c("eversmok", "exercise_how_often")
+binary_pair_counts_all <- c(eversmok = n_smoking_all, exercise_how_often = n_exercise_all)
+binary_pair_counts_mz <- c(eversmok = n_smoking_mz, exercise_how_often = n_exercise_mz)
 
 # Create and save forest plots for binary outcomes - All Pairs
 for (outcome_name in binary_outcomes_for_forest) {
-  plot <- create_within_pair_forest_table(all_within_pair_all, outcome_name, "All Pairs")
+  plot <- create_within_pair_forest_table(
+    all_within_pair_all,
+    outcome_name,
+    "All Pairs",
+    n_pairs = unname(binary_pair_counts_all[[outcome_name]])
+  )
 
   if (!is.null(plot)) {
     save_plot(
@@ -3313,7 +3357,12 @@ for (outcome_name in binary_outcomes_for_forest) {
 
 # Create and save forest plots for binary outcomes - MZ Pairs
 for (outcome_name in binary_outcomes_for_forest) {
-  plot <- create_within_pair_forest_table(all_within_pair_mz, outcome_name, "MZ Pairs")
+  plot <- create_within_pair_forest_table(
+    all_within_pair_mz,
+    outcome_name,
+    "MZ Pairs",
+    n_pairs = unname(binary_pair_counts_mz[[outcome_name]])
+  )
 
   if (!is.null(plot)) {
     save_plot(
